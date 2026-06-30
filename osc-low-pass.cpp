@@ -1,20 +1,57 @@
 #include <iostream>
-#include <cmath>
-#include <vector>
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <unistd.h>
 #include <termios.h>
 #include <AudioToolbox/AudioToolbox.h>
 
 // Global DSP State Constants
 const double SAMPLE_RATE = 44100.0;
-const double FREQUENCY = 440.0; // Base oscillator frequency (A4)
 
-// Atomic or simple globals since they are accessed on the real-time audio thread
-struct DSPState {
-    double globalTime = 0.0;
-    double lastFilteredValue = 0.0;
-    double cutoffFreq = 1000.0; // Initial cut-off
-} gState;
+// One second of audio. 440 Hz over exactly 1 s is an integer number of cycles,
+// so the buffer loops seamlessly. The DSP kernel fills this many f64 samples.
+const size_t BATCH_SAMPLES = 44100;
+
+//===----------------------------------------------------------------------===//
+// DSP-MLIR kernel boundary
+//
+// The DSL `run(out, fc)` is lowered with `llvm.emit_c_interface`, so the
+// backend emits `_mlir_ciface_run`, which takes a pointer to a 1-D memref
+// descriptor (destination-passing: the kernel writes into the caller's buffer)
+// and the cut-off frequency. This mirrors mlir::StridedMemRefType<double, 1>.
+//===----------------------------------------------------------------------===//
+struct MemRefDescriptor1D {
+    double *basePtr;  // allocated pointer
+    double *data;     // aligned pointer
+    int64_t offset;
+    int64_t size;     // sizes[0]
+    int64_t stride;   // strides[0]
+};
+
+extern "C" void _mlir_ciface_run(MemRefDescriptor1D *out, double cutoff);
+
+// Render one batch into `buf` by invoking the DSP-MLIR kernel.
+static void fillBatch(double *buf, size_t n, double cutoff) {
+    MemRefDescriptor1D desc{buf, buf, 0, static_cast<int64_t>(n), 1};
+    _mlir_ciface_run(&desc, cutoff);
+}
+
+// Double-buffered batch: the audio thread streams from gActive while the
+// keyboard thread renders the next batch into the back buffer, then swaps.
+static double gBufferA[BATCH_SAMPLES];
+static double gBufferB[BATCH_SAMPLES];
+static std::atomic<double *> gActive{gBufferA};
+static double *gBackBuffer = gBufferB;
+static size_t gReadPos = 0; // only touched by the audio thread
+static double gCutoff = 1000.0; // current cut-off (keyboard thread + display)
+
+// Render with the given cut-off into the back buffer and publish it.
+static void regenerate(double cutoff) {
+    double *back = gBackBuffer;
+    fillBatch(back, BATCH_SAMPLES, cutoff);
+    gBackBuffer = gActive.exchange(back, std::memory_order_acq_rel);
+}
 
 // Raw Terminal Input Configurations
 struct termios orig_termios;
@@ -40,37 +77,24 @@ OSStatus AudioCallback(void *inRefCon,
                        UInt32 inNumberFrames,
                        AudioBufferList *ioData) 
 {
-    DSPState* state = static_cast<DSPState*>(inRefCon);
-    
     // Core Audio delivers Float32 linear PCM data buffers
     float *leftChannel = static_cast<float*>(ioData->mBuffers[0].mData);
     float *rightChannel = static_cast<float*>(ioData->mBuffers[1].mData);
-    
-    // Dynamic Filter Coefficient Calculations (First-order Low-pass IIR)
-    double RC = 1.0 / (2.0 * M_PI * state->cutoffFreq);
-    double dt = 1.0 / SAMPLE_RATE;
-    double alpha = dt / (RC + dt);
-    double currentVal = state->lastFilteredValue;
-    
+
+    // Stream from the currently published batch, converting f64 -> f32 and
+    // looping at the end of the one-second buffer.
+    const double *batch = gActive.load(std::memory_order_acquire);
+    size_t pos = gReadPos;
+
     for (UInt32 i = 0; i < inNumberFrames; ++i) {
-        double t = state->globalTime + (static_cast<double>(i) / SAMPLE_RATE);
-        
-        // 1. Generate Mathematical Sawtooth Wave
-        double phase = t * FREQUENCY;
-        double signal = 2.0 * (phase - std::floor(phase + 0.5));
-        
-        // 2. Apply Low-Pass Filter
-        currentVal = currentVal + alpha * (signal - currentVal);
-        
-        // 3. Output safely to Stereo channels (-1.0 to 1.0 Float32 range)
-        leftChannel[i] = static_cast<float>(currentVal);
-        rightChannel[i] = static_cast<float>(currentVal);
+        float s = static_cast<float>(batch[pos]); // f64 -> f32 on copy
+        leftChannel[i] = s;
+        rightChannel[i] = s;
+        if (++pos >= BATCH_SAMPLES)
+            pos = 0;
     }
-    
-    // Maintain state counters across discrete audio processing blocks
-    state->globalTime += (static_cast<double>(inNumberFrames) / SAMPLE_RATE);
-    state->lastFilteredValue = currentVal;
-    
+
+    gReadPos = pos;
     return noErr;
 }
 
@@ -123,7 +147,7 @@ int main() {
     // 4. Register the Real-time Callback Render Node
     AURenderCallbackStruct callbackStruct;
     callbackStruct.inputProc = AudioCallback;
-    callbackStruct.inputProcRefCon = &gState;
+    callbackStruct.inputProcRefCon = nullptr; // callback streams from global batch
     
     if (AudioUnitSetProperty(outputUnit,
                              kAudioUnitProperty_SetRenderCallback,
@@ -140,7 +164,10 @@ int main() {
         std::cerr << "Could not initialize Core Audio hardware context buffers." << std::endl;
         return 1;
     }
-    
+
+    // Render the first batch with the initial cut-off before audio starts.
+    regenerate(gCutoff);
+
     if (AudioOutputUnitStart(outputUnit) != noErr) {
         std::cerr << "Could not start audio stream output pipeline." << std::endl;
         return 1;
@@ -166,12 +193,14 @@ int main() {
             if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1) {
                 if (seq[0] == '[') {
                     if (seq[1] == 'A') { // Up Arrow
-                        gState.cutoffFreq = std::min(15000.0, gState.cutoffFreq + 100.0);
-                        printf("\rCut-off Frequency: %.1f Hz   ", gState.cutoffFreq);
+                        gCutoff = std::min(15000.0, gCutoff + 100.0);
+                        regenerate(gCutoff);
+                        printf("\rCut-off Frequency: %.1f Hz   ", gCutoff);
                         fflush(stdout);
                     } else if (seq[1] == 'B') { // Down Arrow
-                        gState.cutoffFreq = std::max(40.0, gState.cutoffFreq - 100.0);
-                        printf("\rCut-off Frequency: %.1f Hz   ", gState.cutoffFreq);
+                        gCutoff = std::max(40.0, gCutoff - 100.0);
+                        regenerate(gCutoff);
+                        printf("\rCut-off Frequency: %.1f Hz   ", gCutoff);
                         fflush(stdout);
                     }
                 }

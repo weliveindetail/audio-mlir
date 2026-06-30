@@ -1,111 +1,67 @@
 # DSP-MLIR: Oscillator + Low-Pass Filter — Research Notes
 
-## What DSP-MLIR Is
+## Batch-and-stream C++ implementation
 
-A compiler infrastructure extending LLVM/MLIR with a custom DSP dialect. The `.py` files in `test/Examples/DspExample/` are **not Python** — they are a custom DSL compiled by `build-relwithdebinfo/bin/dsp1`. The DSL processes static, fixed-size arrays and compiles to MLIR intermediate representation.
+- f64→f32 on copy: AudioCallback reads double samples from the published batch and casts to
+float per-sample into the CoreAudio buffers.
+- Batch-and-stream: regenerate() renders a full 1-second batch into the back buffer via the
+kernel, then atomically swaps it in. The audio thread streams from gActive with
+wraparound; the keyboard thread triggers a regenerate on each arrow press.
+- Thread safety: single std::atomic<double*> pointer swap (acq/rel) publishes a
+fully-rendered buffer; no torn reads.
 
----
+## Moving to block-based processing later
 
-## Can the DSL Represent an Oscillator + LPF Pipeline?
+The current design recomputes a whole second of audio on every cutoff change and loops it.
+Block-based means the kernel produces exactly inNumberFrames of fresh audio per audio
+callback, with continuity across calls. That requires carrying state the current run(out,
+fc) kernel doesn't have:
 
-**Yes — both are expressible.**
+1. Oscillator phase continuity. Right now getRangeOfVector(0, 44100, dt) always starts at
+t=0. Across blocks the sine must not restart, or you get a click every block. The kernel
+needs a phase (or sample-index) input/output: take phase_in, generate n samples starting
+there, and write back phase_out. In the DSL that's a start offset added to the time vector;
+at the ABI level it's an extra double* in/out parameter (or a returned scalar).
 
-### Oscillator (sine wave)
-No dedicated `oscillator()` primitive exists, but one can be composed from three ops:
+2. FIR filter state (the hard part). A 101-tap FIR convolution needs the previous N−1 = 100
+input samples to compute the first outputs of the new block — otherwise each block's
+leading 100 samples are wrong and you hear edge artifacts at every boundary. The standard
+fix is overlap-save: keep a 100-sample history of the oscillator signal, prepend it to the
+new block, convolve, and discard the transient. So the kernel needs a second caller-owned
+state buffer (hist[100]) that it reads at entry and updates at exit.
 
-```dsp
-var pi   = 3.14159265359;
-var freq = 440.0;
-var dt   = 0.000022675736;              # 1 / 44100
-var time = getRangeOfVector(0, 44100, dt);
-var phase   = gain(time, 2 * pi * freq);
-var osc     = sin(phase);
-```
+3. Cutoff changes mid-stream. Recomputing the windowed-sinc coefficients every block
+(cheap, 101 taps) is fine, but changing coefficients instantaneously causes a small
+discontinuity. Acceptable for a demo; a crossfade between old/new coefficient sets removes
+it.
 
-- `getRangeOfVector(first, N, step)` — generates a time/phase array
-- `gain(tensor, scalar)` — scales every element
-- `sin(tensor)` — element-wise sine (`SinOp`, `Ops.td` line 1125, `MLIRGen.cpp` line 694)
+4. Kernel signature growth. run(out, fc) becomes roughly:
+run(out, n, fc, phase_in_out, hist_in_out)
+i.e. the block length n, plus two extra caller-owned state buffers the kernel
+reads-then-writes. On the compiler side this is the same out-param/destination-passing
+machinery you're already building — just more memref arguments threaded through
+FuncOpLowering, no new mechanism.
 
-### Low-Pass FIR Filter
-Exact match to the DSP-MLIR idiom shown in `dsp_biomedical.py`:
+5. C++ side. AudioCallback calls run(...) directly with out = ioData (after an f64 scratch
+buffer + convert, since CoreAudio wants f32), n = inNumberFrames, and the persistent
+gPhase/gHist state. The double-buffer/batch scaffolding goes away; the callback does real
+work, so the kernel must stay within the real-time budget (101-tap FIR × ~512 frames is
+trivially fine).
 
-```dsp
-var Fs  = 44100;
-var fc  = 1000.0;
-var N   = 101;
-var wc  = 2 * pi * fc / Fs;    # normalized cutoff, range 0..pi
-var lpf   = lowPassFIRFilter(wc, N);
-var lpf_w = lpf * hamming(N);
-var filtered = FIRFilterResponse(osc, lpf_w);
-print(filtered);
-```
+The biggest lift is #2 — the FIR history buffer is what makes blocks seamless, and it's the
+one piece the static DSL pipeline has no concept of today.
 
-- `lowPassFIRFilter(wc, N)` — designs FIR coefficients (`LowPassFIRFilterOp`, `Ops.td` line 1482)
-- `hamming(N)` — Hamming window to smooth the filter
-- `FIRFilterResponse(signal, coeffs)` — convolves signal with filter (`FIRFilterResponseOp`, `Ops.td` line 673)
+❯ /cost                                                                                      
+  ⎿  Total cost:            $23.00                                                           
+     Total duration (API):  34m 47s                                                          
+     Total duration (wall): 3h 59m 15s                                                       
+     Total code changes:    222 lines added, 43 lines removed                                
+     Usage by model:                                                                         
+         claude-haiku-4-5:  1.5k input, 19.3k output, 4.6m cache read, 186.7k cache write    
+     ($0.79)                                                                                 
+        claude-sonnet-4-6:  276 input, 27.4k output, 1.5m cache read, 102.1k cache write     
+     ($1.25)
+            claude-opus-4:  3.2k input, 64.9k output, 4.4m cache read, 506.6k cache write
+     ($20.96)
 
-**Critical:** `wc` must be normalized as `2 * pi * fc / Fs` (range 0 to pi, as commented in `dsp_biomedical.py`). The oscillator's `dt` and the filter's `Fs` must use the same sample rate.
-
----
-
-## JIT Execution — Key Facts
-
-The compiler supports `--emit=jit` which compiles and runs the program, printing results to stdout.
-
-| Signal size | JIT time |
-|-------------|----------|
-| 3 samples (gain only) | ~22 ms |
-| 200 samples (osc + LPF) | ~234 ms |
-| 4 410 samples (0.1 s at 44 100 Hz) | ~255 ms |
-| 44 100 samples (1 s at 44 100 Hz) | **~89 ms** |
-
-Larger signals are *faster* because JIT compilation overhead is constant and dominates small inputs. For 1-second audio segments the round-trip is ~89 ms — acceptable for interactive filter sweeps.
-
-**Output format:** space-separated floats on stdout.
-Output length = `input_length + filter_taps - 1` (linear convolution). For 44 100 input + 101 taps → 44 200 values.
-
----
-
-## Constraints of the DSL
-
-| Capability | Status |
-|------------|--------|
-| Static fixed-size signal processing | yes |
-| Oscillator via `getRangeOfVector` + `sin` + `gain` | yes |
-| FIR LPF via `lowPassFIRFilter` + `hamming` + `FIRFilterResponse` | yes |
-| Scalar arithmetic (`2 * pi * fc / Fs`) | yes |
-| Real-time streaming / callbacks | no |
-| Runtime parameters (change cutoff without recompile) | no |
-| Audio output (WAV, speakers) | no |
-
----
-
-## Integration Strategy for an Interactive Python App
-
-Because the DSL can't stream or react to runtime input, the split is:
-
-```
-DSL file    → formal specification of the signal processing graph
-Python app  → real-time audio streaming + keyboard control
-```
-
-**Practical approach (~89 ms latency on cutoff change):**
-
-1. Python writes a temporary DSL file with the current `fc` substituted in
-2. Calls `dsp1 --emit=jit tmp.py` in a subprocess
-3. Parses the float array from stdout into a numpy array
-4. Feeds it into `sounddevice` as a looping audio buffer
-5. On Up/Down keypress, spawns a background thread to recompile and swap buffers
-
----
-
-## Relevant File Locations
-
-| Path | Purpose |
-|------|---------|
-| `build-relwithdebinfo/bin/dsp1` | DSL compiler / JIT runner |
-| `DSP_MLIR/mlir/examples/dsp/SimpleBlocks/include/toy/Ops.td` | All op definitions (TableGen) |
-| `DSP_MLIR/mlir/examples/dsp/SimpleBlocks/mlir/MLIRGen.cpp` | Op name to MLIR mapping |
-| `DSP_MLIR/mlir/test/Examples/DspExample/dsp_biomedical.py` | Best reference for LPF idiom |
-| `DSP_MLIR/mlir/test/Examples/DspExample/dsp_abs_argmax.py` | `getRangeOfVector` usage example |
-| `samples/osc-low-pass.py` | Existing working Python app (sounddevice + pygame, IIR filter) |
+claude --resume 48701461-7c6a-4dd0-a967-120d220de8e7
