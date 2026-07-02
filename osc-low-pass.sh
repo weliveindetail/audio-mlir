@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -ex
 
 # Build the DSP-MLIR kernel object first (dsp.mlir -> dsp.ll -> dsp.o).
 ./dsp.sh

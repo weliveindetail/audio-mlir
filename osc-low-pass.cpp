@@ -11,10 +11,17 @@ const double SAMPLE_RATE = 44100.0;
 
 // The kernel convolves 44100 signal samples with a 101-tap FIR, so linear
 // convolution yields 44100 + 101 - 1 = 44200 output samples. The out-buffer
-// must match that length exactly (memref<44200xf64> on the MLIR side). Note the
-// extra 100 tail samples mean the loop point is not a perfect 1 s boundary, so
-// there is a faint seam when the batch wraps; acceptable for now.
+// must match that length exactly (memref<44200xf64> on the MLIR side).
 const size_t BATCH_SAMPLES = 44200;
+
+// The 440 Hz tone is exactly periodic over 44100 samples (440 whole cycles), so
+// its filtered output is periodic with that same period. Linear convolution is
+// just the circular convolution with the last FIR_TAIL samples spilling past
+// the period; folding that tail back onto the head (out[n] += out[44100+n])
+// reconstructs the circular convolution exactly. We then loop over LOOP_SAMPLES
+// for a mathematically seamless join (no crossfade / amplitude wobble needed).
+const size_t LOOP_SAMPLES = 44100;
+const size_t FIR_TAIL = BATCH_SAMPLES - LOOP_SAMPLES; // 100 = taps - 1
 
 //===----------------------------------------------------------------------===//
 // DSP-MLIR kernel boundary
@@ -53,6 +60,10 @@ static double gCutoff = 1000.0; // current cut-off (keyboard thread + display)
 static void regenerate(double cutoff) {
     double *back = gBackBuffer;
     fillBatch(back, BATCH_SAMPLES, cutoff);
+    // Fold the FIR tail back onto the head: linear -> circular convolution, so
+    // the LOOP_SAMPLES-long buffer loops seamlessly.
+    for (size_t n = 0; n < FIR_TAIL; ++n)
+        back[n] += back[LOOP_SAMPLES + n];
     gBackBuffer = gActive.exchange(back, std::memory_order_acq_rel);
 }
 
@@ -93,7 +104,7 @@ OSStatus AudioCallback(void *inRefCon,
         float s = static_cast<float>(batch[pos]); // f64 -> f32 on copy
         leftChannel[i] = s;
         rightChannel[i] = s;
-        if (++pos >= BATCH_SAMPLES)
+        if (++pos >= LOOP_SAMPLES)
             pos = 0;
     }
 
