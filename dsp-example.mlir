@@ -1,9 +1,9 @@
 module {
-  dsp.func @run(%out: memref<44200xf64>, %cutoff: f64) attributes {llvm.emit_c_interface} {
+  dsp.func @run() {
     %0 = dsp.constant dense<3.1415926535900001> : tensor<f64>
     %1 = dsp.constant dense<4.410000e+04> : tensor<f64>
     %2 = dsp.constant dense<4.400000e+02> : tensor<f64>
-    %3 = tensor.from_elements %cutoff : tensor<f64>
+    %3 = dsp.constant dense<1.000000e+03> : tensor<f64>
     %4 = dsp.constant dense<1.010000e+02> : tensor<f64>
     %5 = dsp.constant dense<2.2675735999999999E-5> : tensor<f64>
     %6 = dsp.constant dense<0.000000e+00> : tensor<f64>
@@ -22,6 +22,7 @@ module {
     %19 = dsp.hamming(%4 : tensor<f64>) to tensor<*xf64>
     %20 = dsp.mul %18, %19 : tensor<*xf64>
     %21 = "dsp.FIRFilterResponse"(%13, %20) : (tensor<*xf64>, tensor<*xf64>) -> tensor<*xf64>
-    dsp.return %21 : tensor<*xf64>
+    dsp.print %21 : tensor<*xf64>
+    dsp.return
   }
 }

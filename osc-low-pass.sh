@@ -1,2 +1,8 @@
 #!/usr/bin/env bash
-clang++ -O3 osc-low-pass.cpp -framework AudioToolbox -framework CoreAudio -o osc-low-pass
+set -e
+
+# Build the DSP-MLIR kernel object first (dsp.mlir -> dsp.ll -> dsp.o).
+./dsp.sh
+
+# Link the CoreAudio host against the compiled kernel.
+clang++ -O3 osc-low-pass.cpp dsp.o -framework AudioToolbox -framework CoreAudio -o osc-low-pass

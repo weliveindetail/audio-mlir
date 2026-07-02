@@ -9,9 +9,12 @@
 // Global DSP State Constants
 const double SAMPLE_RATE = 44100.0;
 
-// One second of audio. 440 Hz over exactly 1 s is an integer number of cycles,
-// so the buffer loops seamlessly. The DSP kernel fills this many f64 samples.
-const size_t BATCH_SAMPLES = 44100;
+// The kernel convolves 44100 signal samples with a 101-tap FIR, so linear
+// convolution yields 44100 + 101 - 1 = 44200 output samples. The out-buffer
+// must match that length exactly (memref<44200xf64> on the MLIR side). Note the
+// extra 100 tail samples mean the loop point is not a perfect 1 s boundary, so
+// there is a faint seam when the batch wraps; acceptable for now.
+const size_t BATCH_SAMPLES = 44200;
 
 //===----------------------------------------------------------------------===//
 // DSP-MLIR kernel boundary
