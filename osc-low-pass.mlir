@@ -10,12 +10,19 @@ module {
     %count = dsp.constant dense<4.410000e+04> : tensor<f64>
     %dt = dsp.constant dense<2.2675735999999999E-5> : tensor<f64>
     %t = "dsp.getRangeOfVector"(%zero, %count, %dt) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<*xf64>
-    %phase = "dsp.gain"(%t, %freq) : (tensor<*xf64>, tensor<f64>) -> tensor<*xf64>
+
+    // Broadcast freq to a full-length vector so the phase multiply is
+    // vector*vector (1-D accesses). dsp.gain's scalar broadcast instead loads a
+    // 0-D memref *inside* the loop, which makes affine loop fusion fail with an
+    // assertion.
+    %freqvec = "dsp.getRangeOfVector"(%freq, %count, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<*xf64>
+    %phase = "dsp.mul"(%t, %freqvec) : (tensor<*xf64>, tensor<*xf64>) -> tensor<*xf64>
     %one = dsp.constant dense<1.000000e+00> : tensor<f64>
     %ones = "dsp.getRangeOfVector"(%one, %count, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<*xf64>
     %frac = "dsp.modulo"(%phase, %ones) : (tensor<*xf64>, tensor<*xf64>) -> tensor<*xf64>
-    %two = dsp.constant dense<2.000000e+00> : tensor<f64>
-    %saw2 = "dsp.gain"(%frac, %two) : (tensor<*xf64>, tensor<f64>) -> tensor<*xf64>
+
+    // 2*frac as frac+frac (vector add) rather than dsp.gain by 2, same reason.
+    %saw2 = "dsp.add"(%frac, %frac) : (tensor<*xf64>, tensor<*xf64>) -> tensor<*xf64>
     %saw = "dsp.sub"(%saw2, %ones) : (tensor<*xf64>, tensor<*xf64>) -> tensor<*xf64>
     dsp.return %saw : tensor<*xf64>
   }
