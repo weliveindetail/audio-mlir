@@ -1,10 +1,15 @@
 # audio-mlir
 
-This is a research project to build an audio MLIR dialect on top of [DSP-MLIR](https://arxiv.org/abs/2408.11205). Please consider it a very early-stage hack right now.
+This is a research project to build an audio MLIR dialect on top of [DSP-MLIR](https://arxiv.org/abs/2408.11205).
+Please consider it a very early-stage hack right now.
+
+You can try an early live demo in your browser here:
+https://weliveindetail.github.io/audio-mlir/sample-wasm/
 
 ## Build the DSP compiler
 
-This will build the LLVM fork with the compiler. It's gonna take a while. Make sure to use sccache for development.
+This will build the LLVM fork with the compiler. It's gonna take a while.
+Make sure to use sccache for development.
 ```
 > git clone https://github.com/weliveindetail/dsp-mlir
 > cmake -GNinja -Bbuild-relwithdebinfo -Sdsp-mlir/llvm \
@@ -16,17 +21,39 @@ This will build the LLVM fork with the compiler. It's gonna take a while. Make s
 > ninja -C build-relwithdebinfo dsp1
 ```
 
-## Build the sample app
+## Build the sample
 
-Now, use the `dsp1` compiler binary and your C++ host toolchain to build the sample app. I only tested on macOS so far:
+Right now, this repo only contains one sample app.
+The audio-mlir dialect itself is (still) implemented in-tree in LLVM above.
+The sample plays a sawtooth oscillator through a low-pass filter.
+The filter's cut-off frequency can be adjusted for illustration.
+The entire audio pipeline is defined in the target-agnostic [osc-low-pass.mlir](osc-low-pass.mlir) file.
+Before we build that, let's checkout the repo:
 ```
 > git clone https://github.com/weliveindetail/audio-mlir samples
 > cd samples
+```
 
+### WebAssembly
+
+Once the LLVM build finished, we can use `dsp1` to compile our audio pipeline into a WebAssembly module.
+[This sample HTML file](sample-wasm/index.html) illustrates how to load and use it. You can try the [live demo in your browser here](https://weliveindetail.github.io/audio-mlir/sample-wasm/).
+```
+> ./sample-wasm.sh 
++ dsp1 osc-low-pass.mlir --emit=wasm -o out/osc-low-pass.wasm
++ wasm-ld --export=_mlir_ciface_run --export=cutoff ... out/osc-low-pass.wasm -o sample-wasm/osc-low-pass.linked.wasm
++ set +x
+Sample is serving at http://localhost:8000/
+Serving HTTP on :: port 8000 (http://[::]:8000/) ...
+```
+
+### C++ sample app
+
+The `dsp1` compiler can emit a native object as well.
+[sample-macOS.cpp](sample-macOS.cpp) implements the native CoreAudio wrapper for macOS hosts.
+Use your C++ host toolchain to build it. I only tested on macOS so far:
+```
 > ./sample-macOS.sh
-+ mkdir -p out
-++ pwd
-+ PATH='/Users/ez/Develop/DSP-MLIR/samples/../build-relwithdebinfo/bin:...'
 + dsp1 osc-low-pass.mlir --emit=llvm
 + llc out/osc-low-pass-native.ll -filetype=obj -o out/osc-low-pass-native.o
 + clang++ -O3 sample-macOS.cpp out/osc-low-pass-native.o -framework AudioToolbox -framework CoreAudio -o out/sample-macOS
@@ -46,5 +73,3 @@ Cut-off Frequency: 2100.0 Hz
 
 Stopping audio engine and cleaning up channels...
 ```
-
-This plays a sawtooth oscillator through a low-pass filter. The filter's cut-off frequency can be adjusted for illustration. The entire audio processing is implemented in [osc-low-pass.mlir](osc-low-pass.mlir). [sample-macOS.cpp](sample-macOS.cpp) implements the native CoreAudio wrapper for macOS hosts.
