@@ -1,7 +1,9 @@
 #include <iostream>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <thread>
 #include <unistd.h>
 #include <termios.h>
 #include <AudioToolbox/AudioToolbox.h>
@@ -41,31 +43,47 @@ struct MemRefDescriptor1D {
 extern "C" void _mlir_ciface_run(MemRefDescriptor1D *out);
 extern "C" double cutoff; // the DSL's @cutoff global, read inside the kernel
 
-// Render one batch into `buf` by invoking the DSP-MLIR kernel.
-static void fillBatch(double *buf, size_t n, double cutoffHz) {
-    cutoff = cutoffHz; // publish the cut-off the kernel will read
+// Render one batch into `buf` by invoking the DSP-MLIR kernel, which reads the
+// current cut-off straight from the `cutoff` global.
+static void fillBatch(double *buf, size_t n) {
     MemRefDescriptor1D desc{buf, buf, 0, static_cast<int64_t>(n), 1};
     _mlir_ciface_run(&desc);
 }
 
 // Double-buffered batch: the audio thread streams from gActive while the
-// keyboard thread renders the next batch into the back buffer, then swaps.
+// render thread rebuilds the next batch into the back buffer, then swaps.
 static double gBufferA[BATCH_SAMPLES];
 static double gBufferB[BATCH_SAMPLES];
 static std::atomic<double *> gActive{gBufferA};
 static double *gBackBuffer = gBufferB;
 static size_t gReadPos = 0; // only touched by the audio thread
-static double gCutoff = 1000.0; // current cut-off (keyboard thread + display)
+static std::atomic<bool> gRunning{true}; // keeps the render thread alive
 
-// Render with the given cut-off into the back buffer and publish it.
-static void regenerate(double cutoff) {
+// How often the render thread rebuilds the batch. Both buffers hold the same
+// phase-aligned 440 Hz content, so swapping mid-stream is seamless; this only
+// bounds how quickly a cut-off change becomes audible.
+constexpr auto REGEN_PERIOD = std::chrono::milliseconds(100);
+
+// Rebuild the back buffer from the kernel (which reads the current `cutoff`
+// global) and publish it for the audio thread. Only the render thread calls
+// this once audio is live, so it is the sole owner of gBackBuffer.
+static void regenerate() {
     double *back = gBackBuffer;
-    fillBatch(back, BATCH_SAMPLES, cutoff);
+    fillBatch(back, BATCH_SAMPLES);
     // Fold the FIR tail back onto the head: linear -> circular convolution, so
     // the LOOP_SAMPLES-long buffer loops seamlessly.
     for (size_t n = 0; n < FIR_TAIL; ++n)
         back[n] += back[LOOP_SAMPLES + n];
     gBackBuffer = gActive.exchange(back, std::memory_order_acq_rel);
+}
+
+// Background render thread: periodically regenerate so cut-off changes written
+// to the `cutoff` symbol (from the keyboard thread) are picked up asynchronously.
+static void renderLoop() {
+    while (gRunning.load(std::memory_order_relaxed)) {
+        regenerate();
+        std::this_thread::sleep_for(REGEN_PERIOD);
+    }
 }
 
 // Raw Terminal Input Configurations
@@ -180,13 +198,17 @@ int main() {
         return 1;
     }
 
-    // Render the first batch with the initial cut-off before audio starts.
-    regenerate(gCutoff);
+    // Initialize the cut-off parameter and render the first batch before audio starts.
+    cutoff = 1000.0;
+    regenerate();
 
     if (AudioOutputUnitStart(outputUnit) != noErr) {
         std::cerr << "Could not start audio stream output pipeline." << std::endl;
         return 1;
     }
+
+    // Hand off periodic regeneration to the background render thread.
+    std::thread renderThread(renderLoop);
     
     std::cout << "\n==============================================" << std::endl;
     std::cout << "   CoreAudio Low-Pass Filter Synth Running!   " << std::endl;
@@ -207,15 +229,15 @@ int main() {
             char seq[2];
             if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1) {
                 if (seq[0] == '[') {
+                    // Arrow keys only nudge the `cutoff` symbol; the render
+                    // thread picks up the new value on its next pass.
                     if (seq[1] == 'A') { // Up Arrow
-                        gCutoff = std::min(15000.0, gCutoff + 100.0);
-                        regenerate(gCutoff);
-                        printf("\rCut-off Frequency: %.1f Hz   ", gCutoff);
+                        cutoff = std::min(15000.0, cutoff + 100.0);
+                        printf("\rCut-off Frequency: %.1f Hz   ", cutoff);
                         fflush(stdout);
                     } else if (seq[1] == 'B') { // Down Arrow
-                        gCutoff = std::max(40.0, gCutoff - 100.0);
-                        regenerate(gCutoff);
-                        printf("\rCut-off Frequency: %.1f Hz   ", gCutoff);
+                        cutoff = std::max(40.0, cutoff - 100.0);
+                        printf("\rCut-off Frequency: %.1f Hz   ", cutoff);
                         fflush(stdout);
                     }
                 }
@@ -225,6 +247,8 @@ int main() {
     
     // 7. Cleanup Resources Safely on Exit
     std::cout << "\n\nStopping audio engine and cleaning up channels..." << std::endl;
+    gRunning.store(false, std::memory_order_relaxed);
+    renderThread.join();
     AudioOutputUnitStop(outputUnit);
     AudioComponentInstanceDispose(outputUnit);
     return 0;
