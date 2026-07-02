@@ -26,10 +26,9 @@ const size_t FIR_TAIL = BATCH_SAMPLES - LOOP_SAMPLES; // 100 = taps - 1
 //===----------------------------------------------------------------------===//
 // DSP-MLIR kernel boundary
 //
-// The DSL `run(out, fc)` is lowered with `llvm.emit_c_interface`, so the
-// backend emits `_mlir_ciface_run`, which takes a pointer to a 1-D memref
-// descriptor (destination-passing: the kernel writes into the caller's buffer)
-// and the cut-off frequency. This mirrors mlir::StridedMemRefType<double, 1>.
+// The DSL `run(out)` is lowered with `llvm.emit_c_interface`, so the backend
+// emits `_mlir_ciface_run`. It takes a pointer to a 1-D memref descriptor for
+// the sample buffer, mirroring mlir::StridedMemRefType<double, 1>.
 //===----------------------------------------------------------------------===//
 struct MemRefDescriptor1D {
     double *basePtr;  // allocated pointer
@@ -39,12 +38,14 @@ struct MemRefDescriptor1D {
     int64_t stride;   // strides[0]
 };
 
-extern "C" void _mlir_ciface_run(MemRefDescriptor1D *out, double cutoff);
+extern "C" void _mlir_ciface_run(MemRefDescriptor1D *out);
+extern "C" double cutoff; // the DSL's @cutoff global, read inside the kernel
 
 // Render one batch into `buf` by invoking the DSP-MLIR kernel.
-static void fillBatch(double *buf, size_t n, double cutoff) {
+static void fillBatch(double *buf, size_t n, double cutoffHz) {
+    cutoff = cutoffHz; // publish the cut-off the kernel will read
     MemRefDescriptor1D desc{buf, buf, 0, static_cast<int64_t>(n), 1};
-    _mlir_ciface_run(&desc, cutoff);
+    _mlir_ciface_run(&desc);
 }
 
 // Double-buffered batch: the audio thread streams from gActive while the

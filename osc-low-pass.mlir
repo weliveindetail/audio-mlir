@@ -1,4 +1,7 @@
 module {
+  // Filter cut-off in Hz exposed as an external symbol
+  memref.global "public" @cutoff : memref<f64> = dense<1.000000e+03>
+
   // Sawtooth oscillator with frequency parameter: saw(t) = 2*frac(t*freq) - 1
   // where `frac` is `phase mod 1`. Consider switching to phase when moving on
   // to block-based processing.
@@ -37,9 +40,11 @@ module {
   }
 
   // Feed a 440 Hz sawtooth through a low-pass filter
-  dsp.func @run(%out: memref<44200xf64>, %cutoff: f64) attributes {llvm.emit_c_interface} {
+  dsp.func @run(%out: memref<44200xf64>) attributes {llvm.emit_c_interface} {
     %freq = dsp.constant dense<4.400000e+02> : tensor<f64>
-    %cut = tensor.from_elements %cutoff : tensor<f64>
+    %cutmem = memref.get_global @cutoff : memref<f64>
+    %cutval = memref.load %cutmem[] : memref<f64>
+    %cut = tensor.from_elements %cutval : tensor<f64>
     %osc = dsp.generic_call @sawtooth(%freq) : (tensor<f64>) -> tensor<*xf64>
     %y = dsp.generic_call @lowpass(%osc, %cut) : (tensor<*xf64>, tensor<f64>) -> tensor<*xf64>
     dsp.return %y : tensor<*xf64>
