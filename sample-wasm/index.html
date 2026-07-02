@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DSP-MLIR — WASM Low-Pass Sawtooth Synth</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+         background:#0e1116; color:#d7dde5; margin:0; padding:2rem;
+         display:flex; justify-content:center; }
+  main { width:min(680px, 100%); }
+  h1 { font-size:1.25rem; font-weight:600; margin:0 0 .25rem; }
+  p.sub { color:#8b949e; margin:.25rem 0 1.5rem; font-size:.85rem; line-height:1.4; }
+  .panel { background:#161b22; border:1px solid #21262d; border-radius:10px;
+           padding:1.25rem 1.5rem; }
+  .row { display:flex; align-items:center; gap:1rem; margin:1rem 0; }
+  button { font:inherit; cursor:pointer; border:1px solid #30363d; background:#21262d;
+           color:#d7dde5; padding:.55rem 1.1rem; border-radius:7px; }
+  button:hover:not(:disabled){ background:#2d333b; }
+  button:disabled{ opacity:.45; cursor:not-allowed; }
+  button.primary{ background:#238636; border-color:#2ea043; }
+  button.primary:hover:not(:disabled){ background:#2ea043; }
+  input[type=range]{ flex:1; accent-color:#2ea043; }
+  .val { min-width:7.5ch; text-align:right; font-variant-numeric:tabular-nums; }
+  label { color:#8b949e; min-width:6ch; }
+  #status { font-size:.8rem; color:#8b949e; margin-top:1rem; white-space:pre-wrap;
+            border-top:1px solid #21262d; padding-top:.9rem; }
+  code { color:#79c0ff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>audio-mlir sample in WebAssembly &mdash; Low-Pass Sawtooth</h1>
+  <p class="sub">
+    DSP-MLIR kernel that computes a 440&nbsp;Hz sawtooth and feeds it through a
+    101-tap windowed-sinc low-pass FIR in WASM. The cutoff parameter can be
+    adjusted for illustration.
+  </p>
+
+  <div class="panel">
+    <div class="row">
+      <button id="startBtn" class="primary">▶ Start audio</button>
+      <button id="stopBtn" disabled>■ Stop</button>
+    </div>
+    <div class="row">
+      <label for="cutoff">Cut-off</label>
+      <input type="range" id="cutoff" min="40" max="15000" step="20" value="1000" disabled />
+      <span class="val" id="cutoffVal">1000 Hz</span>
+    </div>
+    <div id="status">Ready</div>
+  </div>
+</main>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// DSP kernel constants — must match osc-low-pass.mlir / sample-macOS.cpp.
+// ---------------------------------------------------------------------------
+const SAMPLE_RATE  = 44100;
+const BATCH_SAMPLES = 44200;          // 44100 signal + (101-tap FIR − 1) tail
+const LOOP_SAMPLES  = 44100;          // one seamless period of the 440 Hz tone
+const FIR_TAIL      = BATCH_SAMPLES - LOOP_SAMPLES; // 100 = taps − 1
+const WASM_URL      = 'osc-low-pass.linked.wasm';   // wasm-ld output of osc-low-pass.wasm
+
+const startBtn  = document.getElementById('startBtn');
+const stopBtn   = document.getElementById('stopBtn');
+const cutoffEl  = document.getElementById('cutoff');
+const cutoffVal = document.getElementById('cutoffVal');
+const statusEl  = document.getElementById('status');
+const log = (m) => { statusEl.textContent = m; };
+
+// ---------------------------------------------------------------------------
+// The wasm object is a *relocatable* MLIR kernel linked (wasm-ld) so that:
+//   • env.memory is imported            → we own the linear memory
+//   • malloc/free/memcpy/fmod/sin/cos   → supplied here from JS / Math
+//   • run, _mlir_ciface_run, cutoff     → exported
+// The kernel calls only *our* malloc for its scratch tensors, so we fully
+// control the linear-memory layout below.
+// ---------------------------------------------------------------------------
+let wasm = null;          // instance.exports
+let memory = null;        // WebAssembly.Memory
+let f64 = null, u8 = null, dv = null;  // views (re-acquired after any grow)
+
+let OUT_PTR = 0;          // caller-owned output buffer (BATCH_SAMPLES f64)
+let DESC_PTR = 0;         // MemRefDescriptor1D (32 bytes)
+let ARENA_BASE = 0;       // start of the per-call bump arena for kernel malloc
+let bump = 0;             // current bump pointer (reset before every run)
+let CUTOFF_ADDR = 0;      // linear-memory address behind the exported `cutoff` global
+
+const PAGE = 65536;
+const INITIAL_PAGES = 512;  // 32 MiB — one run's scratch (~6 MiB) fits with room to spare
+
+function refreshViews() {
+  f64 = new Float64Array(memory.buffer);
+  u8  = new Uint8Array(memory.buffer);
+  dv  = new DataView(memory.buffer);
+}
+const align = (x, a) => (x + (a - 1)) & ~(a - 1);
+
+// Bump allocator over the arena. free() is a no-op; the whole arena is reset
+// before each kernel invocation (all kernel allocations are transient).
+function wasmMalloc(sizeBig) {
+  const size = Number(sizeBig);              // env.malloc takes an i64 size
+  const p = bump;
+  bump = align(bump + size, 16);
+  if (bump > memory.buffer.byteLength) {
+    const need = Math.ceil((bump - memory.buffer.byteLength) / PAGE);
+    memory.grow(need);
+    refreshViews();                          // grow detaches old views
+  }
+  return p;
+}
+function wasmMemcpy(dest, src, n) {
+  u8.copyWithin(dest, src, src + n);         // regions never overlap here
+  return dest;
+}
+
+async function initWasm() {
+  memory = new WebAssembly.Memory({ initial: INITIAL_PAGES });
+  refreshViews();
+
+  const imports = {
+    env: {
+      memory,
+      malloc: wasmMalloc,
+      free:   () => {},                      // arena reset handles reclamation
+      memcpy: wasmMemcpy,
+      fmod:   (a, b) => a % b,
+      sin:    Math.sin,
+      cos:    Math.cos,
+    },
+  };
+
+  const resp = await fetch(WASM_URL);
+  if (!resp.ok) throw new Error(`fetch ${WASM_URL}: ${resp.status} ${resp.statusText}`);
+  const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), imports);
+  wasm = instance.exports;
+
+  wasm.__wasm_call_ctors?.();                // run static ctors (initialises data)
+
+  // `cutoff` is exported as an immutable i32 global = the address of the double.
+  CUTOFF_ADDR = wasm.cutoff.value;
+
+  // Lay out our persistent buffers above the kernel's heap base, then the arena.
+  const heapBase = wasm.__heap_base.value;
+  OUT_PTR    = align(heapBase, 16);
+  DESC_PTR   = align(OUT_PTR + BATCH_SAMPLES * 8, 16);
+  ARENA_BASE = align(DESC_PTR + 32, 16);
+
+  // Build the MemRefDescriptor1D once (basePtr, data, offset, size, stride).
+  // Mirrors the native struct; on wasm32 pointers are i32, index fields i64.
+  dv.setUint32(DESC_PTR +  0, OUT_PTR, true);        // basePtr
+  dv.setUint32(DESC_PTR +  4, OUT_PTR, true);        // data (aligned)
+  dv.setBigInt64(DESC_PTR +  8, 0n, true);           // offset
+  dv.setBigInt64(DESC_PTR + 16, BigInt(BATCH_SAMPLES), true); // size
+  dv.setBigInt64(DESC_PTR + 24, 1n, true);           // stride
+
+  setCutoff(Number(cutoffEl.value));                 // seed the shared global
+}
+
+function setCutoff(hz) {
+  dv.setFloat64(CUTOFF_ADDR, hz, true);      // write the shared @cutoff global
+}
+
+// Render one batch through the kernel and fold the FIR tail so the first
+// LOOP_SAMPLES loop seamlessly (linear → circular convolution), exactly as
+// regenerate() does in sample-macOS.cpp.
+function renderLoopBuffer(outFloat32) {
+  bump = ARENA_BASE;                         // fresh arena per invocation
+  wasm._mlir_ciface_run(DESC_PTR);           // native ABI: pointer to descriptor
+
+  const base = OUT_PTR / 8;                  // f64 index of the output buffer
+  for (let n = 0; n < FIR_TAIL; ++n)
+    f64[base + n] += f64[base + LOOP_SAMPLES + n];
+  for (let n = 0; n < LOOP_SAMPLES; ++n)
+    outFloat32[n] = f64[base + n];           // f64 → f32 on copy
+}
+
+// ---------------------------------------------------------------------------
+// Web Audio: a looping AudioBuffer per cut-off, crossfaded on change so
+// parameter tweaks stay click-free (the browser analogue of the C++
+// double-buffer swap).
+// ---------------------------------------------------------------------------
+let ctx = null;
+let currentSource = null, currentGain = null;
+const MASTER = 0.8;   // headroom: filtered peaks reach ~1.1, would clip at ±1
+
+function makeLoopBuffer() {
+  const buf = ctx.createBuffer(1, LOOP_SAMPLES, SAMPLE_RATE);
+  renderLoopBuffer(buf.getChannelData(0));
+  return buf;
+}
+
+function startVoice(buffer, fadeIn) {
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  src.loop = true;
+  const g = ctx.createGain();
+  const now = ctx.currentTime;
+  g.gain.setValueAtTime(fadeIn ? 0 : MASTER, now);
+  if (fadeIn) g.gain.linearRampToValueAtTime(MASTER, now + 0.03);
+  src.connect(g).connect(ctx.destination);
+  src.start();
+  return { src, g };
+}
+
+function swapVoice() {
+  const buffer = makeLoopBuffer();
+  const next = startVoice(buffer, true);
+  if (currentSource) {
+    const now = ctx.currentTime;
+    currentGain.gain.setValueAtTime(currentGain.gain.value, now);
+    currentGain.gain.linearRampToValueAtTime(0, now + 0.03);
+    const old = currentSource;
+    setTimeout(() => { try { old.stop(); } catch {} }, 60);
+  }
+  currentSource = next.src;
+  currentGain   = next.g;
+}
+
+async function start() {
+  startBtn.disabled = true;
+  try {
+    log('Loading + linking WASM kernel…');
+    ctx = new AudioContext();
+    await ctx.resume();
+    if (!wasm) await initWasm();
+    swapVoice();
+    stopBtn.disabled = false;
+    cutoffEl.disabled = false;
+    log(`Playing`);
+  } catch (e) {
+    log('Error: ' + e.message);
+    startBtn.disabled = false;
+    console.error(e);
+  }
+}
+
+function stop() {
+  if (currentSource) { try { currentSource.stop(); } catch {} }
+  currentSource = currentGain = null;
+  stopBtn.disabled = true;
+  cutoffEl.disabled = true;
+  startBtn.disabled = false;
+  log('Stopped');
+}
+
+// Debounce regeneration on slider drag so we re-run the kernel at most ~every 60 ms,
+// mirroring REGEN_PERIOD in the native host.
+let regenTimer = null;
+cutoffEl.addEventListener('input', () => {
+  const hz = Number(cutoffEl.value);
+  cutoffVal.textContent = `${hz} Hz`;
+  if (!wasm || !currentSource) return;
+  setCutoff(hz);
+  if (regenTimer) return;
+  regenTimer = setTimeout(() => { regenTimer = null; swapVoice(); }, 60);
+});
+
+startBtn.addEventListener('click', start);
+stopBtn.addEventListener('click', stop);
+</script>
+</body>
+</html>
