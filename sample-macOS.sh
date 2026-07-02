@@ -4,7 +4,7 @@ mkdir -p out
 
 # DSP-MLIR kernel
 PATH=$(pwd)/../build-relwithdebinfo/bin:$PATH
-dsp1 osc-low-pass.mlir --emit=llvm 2> out/osc-low-pass-native.ll
+dsp1 osc-low-pass.mlir --emit=llvm -o out/osc-low-pass-native.ll
 llc out/osc-low-pass-native.ll -filetype=obj -o out/osc-low-pass-native.o
 
 # Link with CoreAudio host
