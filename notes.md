@@ -1,4 +1,4 @@
-# DSP-MLIR: Oscillator + Low-Pass Filter — Research Notes
+# Research Notes
 
 ## Batch-and-stream C++ implementation
 
@@ -50,18 +50,3 @@ trivially fine).
 
 The biggest lift is #2 — the FIR history buffer is what makes blocks seamless, and it's the
 one piece the static DSL pipeline has no concept of today.
-
-❯ /cost                                                                                      
-  ⎿  Total cost:            $23.00                                                           
-     Total duration (API):  34m 47s                                                          
-     Total duration (wall): 3h 59m 15s                                                       
-     Total code changes:    222 lines added, 43 lines removed                                
-     Usage by model:                                                                         
-         claude-haiku-4-5:  1.5k input, 19.3k output, 4.6m cache read, 186.7k cache write    
-     ($0.79)                                                                                 
-        claude-sonnet-4-6:  276 input, 27.4k output, 1.5m cache read, 102.1k cache write     
-     ($1.25)
-            claude-opus-4:  3.2k input, 64.9k output, 4.4m cache read, 506.6k cache write
-     ($20.96)
-
-claude --resume 48701461-7c6a-4dd0-a967-120d220de8e7
