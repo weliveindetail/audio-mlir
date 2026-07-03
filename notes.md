@@ -1,5 +1,74 @@
 # Research Notes
 
+## Uncertainty algebra (a probabilistic MLIR type -- opportunities & challenges)
+
+Motivated by the `noise-lang` DSL (in `../noise-lang`), where every value is a *random
+variable* (a probability distribution), operators lift over random variables, and `P(cond)` /
+`E(x)` estimate probabilities and expectations by Monte Carlo. The question: could we bring that
+"uncertainty algebra" into DSP-MLIR as a first-class type or dialect? This section records the
+design of that ambitious track ("B") so we don't lose the reasoning. The concrete, shippable
+piece ("A" -- noise *signal* generators) is separate and is implemented in the `dsp` dialect;
+see `dsp.noise_white/pink/brown/ou` and `noise-kinds.mlir`.
+
+### The idea
+
+A new type, e.g. `!dsp.rv<f64>`, denoting a random variable rather than a value. Arithmetic ops
+lift over it (`add(rv, rv) -> rv`), distribution ops introduce it (`dsp.sample_normal %mu, %sigma
+: !dsp.rv<f64>`), and *query* ops collapse it back to a number by simulation:
+`dsp.prob %cond -> f64`, `dsp.expect %x -> f64`, `dsp.variance %x -> f64`. A query lowers to a
+Monte-Carlo loop: draw N samples, evaluate the random variable's def-use subgraph with fresh
+draws at the sample sites, and reduce (mean / fraction-true / variance).
+
+### Opportunities (why MLIR is a surprisingly good host)
+
+- **SSA *is* noise-lang's sharing rule.** noise-lang's load-bearing rule is "one name = one
+  fixed draw; every mention reuses it" (`X - X == 0`, `X + X == 2X`). In MLIR an SSA value is
+  exactly one node shared by all its uses. So the def-use graph already encodes the sharing
+  semantics for free; independence = two distinct `sample` ops (mirrors noise-lang's two `~`
+  bindings), and `~[n]` maps to a vector/shaped result.
+- **The query is a clean lowering, not a new runtime.** `dsp.prob`/`dsp.expect` lower to an
+  ordinary affine/scf loop over the backward slice of the queried value, RNG at the sample ops,
+  reduction at the end -- the same machinery the dialect already uses. It JITs/AOTs like any
+  other kernel; no interpreter.
+- **Distributions compose with the existing DSP ops.** Because the RV lifts through arithmetic,
+  you can push a random noise source through a filter and query the *output* statistics -- e.g.
+  `E[residual power]` after the LMS canceller, or `P(SNR > threshold)` -- reusing `dsp.filter`,
+  `dsp.fft`, etc. unchanged.
+- **Analysis passes have real semantics to exploit.** Constant sub-expressions fold eagerly
+  (a point mass), independent-sum variance is additive, affine transforms of a Gaussian stay
+  Gaussian -- a dialect could rewrite some queries to closed form instead of sampling.
+
+### Challenges (and the honest scope limit)
+
+- **Sequential/stateful processes are out of scope -- which is exactly what LMS is.** noise-lang
+  is explicit: it samples independent lanes that *cannot carry state across a time index* (no
+  random walks, Markov chains, queues). The adaptive filter in `lms-noise.mlir` is a per-sample
+  weight recurrence `w[n] = w[n-1] + mu*e[n]*x[n-i]` -- precisely a stateful time recurrence. So
+  the RV algebra **cannot express the canceller's core**; it can only *wrap* it (run the
+  deterministic kernel over an RV noise source across many seeds and estimate output stats).
+  This is the key reason A and B are different layers: A generates the samples, B characterizes
+  the pipeline built on them.
+- **Type-system surface.** `!dsp.rv<T>` needs lifting rules for every arithmetic/comparison op,
+  a bool-RV for conditions, and a conditioning form (`X | C`). That is a lot of ODS + verifier
+  work orthogonal to the current deterministic tensor DSP.
+- **Cost model & seeding.** Each query is an N-sample pass (default 1e6 in noise-lang). Nested
+  queries multiply. Reproducibility needs a threaded, well-defined seed per sample site. Shared
+  vs. independent draws must be tracked precisely or the estimates are silently wrong.
+- **Cross-query consistency isn't free.** As in noise-lang, `P(A)`, `P(B)`, `P(A&&B)` estimated
+  in separate passes need not satisfy `P(A&&B) <= P(A)`; a serious implementation shares one
+  sampling pass per query and rejection-conditions within it.
+- **No scaling inference.** Forward Monte Carlo + rejection conditioning only; importance
+  sampling / MCMC (needed to condition on continuous data) is a further track, same as
+  noise-lang's own roadmap.
+
+### Verdict
+
+B is a legitimate and elegant MLIR dialect (SSA fits the sharing model beautifully), but it
+*characterizes* stochastic pipelines rather than *generating* them, and it structurally can't
+model the LMS recurrence. So it is deferred. What actually helps `lms-noise.mlir` today is A:
+first-class colored-noise **signal generators** in the `dsp` dialect, which is what the rest of
+this work implements.
+
 ## Batch-and-stream C++ implementation
 
 - f64→f32 on copy: AudioCallback reads double samples from the published batch and casts to

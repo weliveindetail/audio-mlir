@@ -9,29 +9,27 @@
 #include <termios.h>
 #include <AudioToolbox/AudioToolbox.h>
 
-// Interactive CoreAudio host for the LMS 60 Hz hum canceller (lms-hum.mlir).
+// Interactive CoreAudio host for the LMS adaptive noise canceller
+// (lms-noise.mlir): a 440 Hz tone buried in broadband noise, with the noise
+// adaptively subtracted by a 32-tap LMS filter.
 //
-// The kernel renders one second of  d[n] = sin(2*pi*440*t) + 0.7*sin(2*pi*60*t)
-// with the 60 Hz mains hum adaptively subtracted by a 32-tap LMS filter whose
-// weights start at zero. So each freshly rendered buffer starts buzzy and the
-// hum fades out as the weights converge -- looping the buffer lets you hear that
-// fade repeat. The arrow keys nudge the LMS step size @mu: larger mu converges
-// faster (buzz clears sooner) but too large diverges.
+//   Up / Down arrows  -> @wet:        how much of the estimated noise to remove
+//                                     (0 = noise back in, 1 = clean tone).
+//   Left / Right arrows -> @noise_kind: cycle the noise *color* the kernel
+//                                     generates -- white / pink / brown / OU.
+//
+// The noise reference is generated in-kernel from an LCG stream, optionally
+// colored by the pink/brown/OU recurrences (the same math the dsp.noise_*
+// dialect ops encode); no RNG primitive or host-fed data is needed.
 
 const double SAMPLE_RATE = 44100.0;
 
-// The kernel writes exactly one second: memref<44100xf64>. 440 Hz and 60 Hz
-// both complete a whole number of cycles over this span (440 and 60), so the
-// buffer loops with no discontinuity and needs no tail folding.
+// The kernel writes exactly one second: memref<44100xf64>.
 const size_t BATCH_SAMPLES = 44100;
 const size_t LOOP_SAMPLES = 44100;
 
 //===----------------------------------------------------------------------===//
 // DSP-MLIR kernel boundary
-//
-// `run(out)` is lowered with `llvm.emit_c_interface`, so the backend emits
-// `_mlir_ciface_run`, taking a pointer to a 1-D memref descriptor mirroring
-// mlir::StridedMemRefType<double, 1>.
 //===----------------------------------------------------------------------===//
 struct MemRefDescriptor1D {
     double *basePtr;  // allocated pointer
@@ -42,11 +40,15 @@ struct MemRefDescriptor1D {
 };
 
 extern "C" void _mlir_ciface_run(MemRefDescriptor1D *out);
-extern "C" double mu;  // the DSL's @mu global (LMS step size, fixed here)
-extern "C" double wet; // the DSL's @wet global: how much of the hum estimate to
-                       // subtract (0 = full hum, 1 = hum removed) -- the knob
+extern "C" double mu;         // the DSL's @mu global (LMS step size, fixed here)
+extern "C" double wet;        // @wet: how much of the noise estimate to subtract
+extern "C" double noise_kind; // @noise_kind: 0=white 1=pink 2=brown 3=ou
 
-// Render one batch by invoking the kernel, which reads the current `mu` global.
+// Number of selectable noise colors and their display names.
+constexpr int NUM_KINDS = 4;
+static const char *kKindNames[NUM_KINDS] = {"white", "pink", "brown", "ou"};
+
+// Render one batch by invoking the kernel, which reads the current globals.
 static void fillBatch(double *buf, size_t n) {
     MemRefDescriptor1D desc{buf, buf, 0, static_cast<int64_t>(n), 1};
     _mlir_ciface_run(&desc);
@@ -61,21 +63,20 @@ static double *gBackBuffer = gBufferB;
 static size_t gReadPos = 0; // only touched by the audio thread
 static std::atomic<bool> gRunning{true};
 
-// How often the render thread rebuilds the batch. This bounds how quickly a mu
-// change becomes audible.
+// How often the render thread rebuilds the batch. Bounds how quickly a wet /
+// noise_kind change becomes audible.
 constexpr auto REGEN_PERIOD = std::chrono::milliseconds(100);
 
-// Rebuild the back buffer from the kernel (which reads the current `mu` global)
-// and publish it. Only the render thread calls this once audio is live, so it
-// is the sole owner of gBackBuffer.
+// Rebuild the back buffer from the kernel and publish it. Only the render
+// thread calls this once audio is live, so it owns gBackBuffer.
 static void regenerate() {
     double *back = gBackBuffer;
     fillBatch(back, BATCH_SAMPLES);
     gBackBuffer = gActive.exchange(back, std::memory_order_acq_rel);
 }
 
-// Background render thread: periodically regenerate so mu changes written from
-// the keyboard thread are picked up asynchronously.
+// Background render thread: periodically regenerate so global changes written
+// from the keyboard thread are picked up asynchronously.
 static void renderLoop() {
     while (gRunning.load(std::memory_order_relaxed)) {
         regenerate();
@@ -96,6 +97,16 @@ void enableRawMode() {
     struct termios raw = orig_termios;
     raw.c_lflag &= ~(ECHO | ICANON);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+// Reprint the single status line (wet % and current noise color).
+static void printStatus() {
+    int kind = static_cast<int>(noise_kind);
+    if (kind < 0) kind = 0;
+    if (kind >= NUM_KINDS) kind = NUM_KINDS - 1;
+    printf("\rNoise reduction: %3.0f%%   |   Noise color: %-6s   ",
+           wet * 100.0, kKindNames[kind]);
+    fflush(stdout);
 }
 
 // CoreAudio render callback.
@@ -187,10 +198,10 @@ int main() {
     }
 
     // Fix mu small so the persistent weights converge over a few looped buffers
-    // and stay converged (keeps the 440 Hz tone undistorted). The interactive
-    // control is `wet`, not mu. Start fully wet (hum removed).
+    // and stay converged. Start fully wet (noise removed) with white noise.
     mu = 0.001;
     wet = 1.0;
+    noise_kind = 0.0; // white
     regenerate();
 
     if (AudioOutputUnitStart(outputUnit) != noErr) {
@@ -201,35 +212,42 @@ int main() {
     std::thread renderThread(renderLoop);
 
     std::cout << "\n==============================================" << std::endl;
-    std::cout << "   CoreAudio LMS Hum Canceller Running!        " << std::endl;
+    std::cout << "   CoreAudio LMS Adaptive Noise Canceller Running!" << std::endl;
     std::cout << "==============================================" << std::endl;
-    std::cout << " -> 440 Hz tone with 60 Hz mains hum; the LMS filter estimates" << std::endl;
-    std::cout << "    the hum and the knob below sweeps how much of it to subtract." << std::endl;
-    std::cout << " -> Press [UP Arrow]   to add cancellation (sweep toward hum-free)" << std::endl;
-    std::cout << " -> Press [DOWN Arrow] to back it off (sweep the 60 Hz hum back in)" << std::endl;
-    std::cout << " -> Press [Q] or Ctrl+C to stop the program safely" << std::endl;
+    std::cout << " -> A 440 Hz tone corrupted by interference; the LMS filter" << std::endl;
+    std::cout << "    estimates the interference and the knobs sweep how much" << std::endl;
+    std::cout << "    of it to remove and which color of noise to fight." << std::endl;
+    std::cout << " -> [UP Arrow]    add cancellation (toward a clean tone)" << std::endl;
+    std::cout << " -> [DOWN Arrow]  back it off (bring the interference back)" << std::endl;
+    std::cout << " -> [RIGHT Arrow] next noise color  (white -> pink -> brown -> ou)" << std::endl;
+    std::cout << " -> [LEFT Arrow]  previous noise color" << std::endl;
+    std::cout << " -> [Q] or Ctrl+C to stop the program safely" << std::endl;
     std::cout << "==============================================\n" << std::endl;
 
     enableRawMode();
+    printStatus();
 
     char c;
     while (read(STDIN_FILENO, &c, 1) == 1 && c != 'q' && c != 'Q') {
-        // Arrow keys send: '\x1b', '[', then 'A' (Up) / 'B' (Down).
+        // Arrow keys send: '\x1b', '[', then 'A' Up / 'B' Down / 'C' Right / 'D' Left.
         if (c == '\x1b') {
             char seq[2];
             if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1) {
                 if (seq[0] == '[') {
-                    // Arrow keys only nudge the `mu` symbol; the render thread
-                    // picks up the new value on its next pass. Clamp to a stable
-                    // range: too large a step size makes the 32-tap LMS diverge.
-                    if (seq[1] == 'A') { // Up Arrow
+                    if (seq[1] == 'A') {        // Up: more cancellation
                         wet = std::min(1.0, wet + 0.05);
-                        printf("\rHum cancellation: %3.0f%%   ", wet * 100.0);
-                        fflush(stdout);
-                    } else if (seq[1] == 'B') { // Down Arrow
+                        printStatus();
+                    } else if (seq[1] == 'B') { // Down: less cancellation
                         wet = std::max(0.0, wet - 0.05);
-                        printf("\rHum cancellation: %3.0f%%   ", wet * 100.0);
-                        fflush(stdout);
+                        printStatus();
+                    } else if (seq[1] == 'C') { // Right: next noise color
+                        int k = (static_cast<int>(noise_kind) + 1) % NUM_KINDS;
+                        noise_kind = static_cast<double>(k);
+                        printStatus();
+                    } else if (seq[1] == 'D') { // Left: previous noise color
+                        int k = (static_cast<int>(noise_kind) + NUM_KINDS - 1) % NUM_KINDS;
+                        noise_kind = static_cast<double>(k);
+                        printStatus();
                     }
                 }
             }
