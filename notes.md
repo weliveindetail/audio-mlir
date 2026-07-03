@@ -50,3 +50,119 @@ trivially fine).
 
 The biggest lift is #2 — the FIR history buffer is what makes blocks seamless, and it's the
 one piece the static DSL pipeline has no concept of today.
+
+## Performance Improvements
+
+The `_run` object we generate today (Toy-tutorial lowering) is one heap buffer + one full
+loop per DSP op, every scalar constant heap-allocated, ~25 malloc/free per call, a scalar
+bounds-checked convolution, and no fusion. It looks alarming but most of the bloat is
+one-time setup/teardown that is NOT on the hot path.
+
+Flop budget for one regenerate() (44100-sample signal, 101-tap FIR):
+- ~9 elementwise loops (t, phase, ones, frac, saw2, saw, wc, coef, ...): ~9 x 44100 ~= 0.4M
+- coefficient build (sinc + hamming, with sin/cos): 101 taps, negligible
+- FIR convolution (44200 x up to 101): ~4.5M mul-add  <- ~90% of runtime
+- ~25 malloc + ~25 free: one-time, a few microseconds (<0.1% vs a few ms of compute)
+
+So the convolution dominates and its inner loop is already the same arithmetic C would emit.
+The naive version is within ~2-4x of hand C, not 20x. There are two independent axes of
+improvement; do not conflate them. Axis A is backend codegen quality (matching C). Axis B is
+the domain-specific algebraic rewrites the DSP-MLIR paper measures.
+
+### Measuring
+
+`bench.sh` builds the kernel object and a standalone driver (`bench.cpp`) that links the same
+`_mlir_ciface_run` as the CoreAudio host but strips the audio machinery, so it times ONLY the
+generated kernel. It is decoupled from how the object is built: change a pass/pipeline, rerun
+`./bench.sh`, diff the output. Usage: `./bench.sh [--iterations N] [--warmup N]`.
+
+Each run prints a human summary plus one machine-readable line an agent can parse:
+`BENCH_JSON {"min_ms":..,"median_ms":..,"stddev_ms":..,"msample_per_s_median":..,"checksum":..}`.
+- Compare `min_ms` (most stable) or `median_ms`; lower is better.
+- `checksum` is the raw kernel output at cutoff=1000Hz. Axis A (pure codegen) must keep it
+  ~bit-stable; Axis B (numeric rewrites like FFT convolution) should keep it within fp
+  tolerance. A changed checksum on an Axis-A change means the optimization broke correctness.
+
+`bench.sh` now builds with `--opt` by default (loop fusion + affine scalar
+replacement); pass `OPT=0 ./bench.sh` to build the plain baseline for an A/B.
+`--opt` used to assert in the affine loop-fusion pass on this kernel; that is
+now fixed -- the sawtooth was rewritten to avoid `dsp.gain`'s 0-D-memref-in-loop
+broadcast, and a new `AffineFusionLegalityPass` (runs right before fusion under
+`--opt`) rejects that pattern with a clear diagnostic instead of crashing.
+
+Baselines on this machine (checksum 1.769572322574197e+01, identical both ways):
+- plain pipeline (`OPT=0`): min ~3.86 ms, median ~4.05 ms/call, ~11 Msample/s.
+- `--opt` (current default): min ~3.44 ms, median ~3.59 ms/call, ~12 Msample/s
+  (~12% faster). This is the number to beat.
+
+What `--opt` already bought (vs plain): affine.for loops 13->9, memref.alloc
+24->13, 44100-elt intermediate buffers 7->4, 0-D scalar memrefs 49->21. It did
+NOT vectorize (zero NEON fp ops), did NOT hoist the convolution bounds check
+(the `affine.if` zero-pad guard is still in the tap loop), and left 16
+malloc/free in the emitted IR. So the hot-path wins (A1/A2) and all of Axis B
+remain open. See the per-task status below.
+
+### Axis A -- backend codegen quality
+
+- [ ] A1. Vectorize the FIR convolution (NEON). The inner loop at the convolution site is
+  scalar (fmul/fadd per tap); SIMD is the single biggest win (~2-4x) and the only change
+  that buys real speed here. Enable MLIR vectorization (e.g. affine/vector lowering, or
+  `-affine-super-vectorize`) so the tap loop emits vector fmla. Verify NEON (`fmla v*.2d`)
+  appears in the disassembly of the convolution loop.
+- [ ] A2. Hoist bounds checks out of the convolution inner loop. The zero-padding
+  `tbnz ...,#0x3f` tests fire every iteration (~4.5M times). Split the output range into
+  head (partial overlap), steady-state (full 101-tap, no checks), and tail regions -- what a
+  C programmer does by hand. This unblocks A1 (a clean steady-state loop vectorizes; a
+  branchy one does not).
+- [~] A3. Stop heap-allocating scalar constants. Each `tensor<f64>` constant (pi, fs, N, 2.0,
+  1.0, freq=440, dt, cutoff-load, ...) lowers to a malloc(8) + store + free. Lower 0-D
+  constants to SSA values (arith.constant / plain f64) instead of a memref. Deletes roughly
+  half the `bl malloc`/`bl free` pairs and all the associated stores. Cleanup + a little
+  speed, low risk.
+  PARTIAL (--opt): affine scalar replacement + the sawtooth rewrite cut 0-D scalar memrefs
+  49->21, but the emitted IR still has 16 malloc/free. Not fully lowered to SSA yet.
+- [~] A4. Fuse the elementwise loops. The sawtooth is 9 separate passes over 9 separate
+  44100-element buffers. Affine loop fusion (`-affine-loop-fusion`) collapses the pointwise
+  chain (t -> phase -> frac -> saw2 -> saw) into one pass over one buffer, cutting memory
+  traffic ~9x and removing the intermediate allocations. Confirm the intermediate buffers
+  disappear from the object.
+  PARTIAL (--opt): fusion is now enabled and collapsed part of the chain (loops 13->9,
+  44100-elt buffers 7->4). Not a single pass yet -- 4 elementwise loops remain; the chain
+  is not fully fused into one.
+- [~] A5. Buffer hoisting / reuse / stack promotion. Add buffer-deallocation +
+  buffer-loop-hoisting; promote small fixed-size buffers (the 101-tap arrays) to stack
+  (memref.alloca) so they never hit malloc. Pairs with A3/A4 to eliminate the remaining
+  one-time allocation overhead.
+  PARTIAL (--opt): total memref.alloc 24->13, but only as a side effect of A4 removing
+  intermediates. No stack promotion happened (memref.alloca count = 0); mallocs remain.
+
+Status legend: [ ] = open, [~] = partially addressed by `--opt`, [x] = done.
+A1 and A2 are untouched by `--opt` and are the real hot-path wins.
+
+Order to attempt: A3 + A4 first (clean up the IR and remove allocations, low risk) -- now
+partly done by `--opt`, finish them off, then A2 (makes the hot loop branch-free), then A1
+(vectorize the now-clean loop -- the real win), then A5 (mop up remaining allocations).
+Measure regenerate() wall-time before/after each.
+
+### Axis B -- domain-specific optimizations
+
+These are legal only because the compiler understands DSP semantics; a generic C compiler
+(and often a C programmer) will not do them automatically. They are the DSP-MLIR value
+proposition and stack on top of good codegen.
+
+- [ ] B1. Time-domain FIR -> FFT convolution. Rewrite the 44100 x 101 convolution as
+  O(N log N) via FFT (multiply spectra, inverse FFT). This is the classic order-of-magnitude
+  DSP win and a pure high-level dialect rewrite -- the single most illustrative change to
+  demonstrate the paper's optimizations, since the whole 44200 x 101 nested loop disappears.
+- [ ] B2. Coefficient hoisting (loop-invariant DSP). The windowed-sinc taps only change when
+  `cutoff` changes; recomputing sinc + hamming (with sin/cos) on every regenerate() is waste.
+  A DSP-aware invariant-hoisting pass lifts coefficient computation out of the per-batch path
+  and recomputes only when cutoff moves.
+- [ ] B3. Exploit input periodicity (linear -> circular convolution). The 440 Hz tone is
+  exactly periodic over 44100 samples, so the filtered output is periodic; folding the FIR
+  tail onto the head (out[n] += out[44100+n]) reconstructs circular convolution. The C++ host
+  already does this by hand -- a DSP dialect that recognizes a periodic input could emit it
+  automatically and drop the 100-sample tail work.
+- [ ] B4. Filter/stage fusion and algebraic identities. Cascade/fuse consecutive filters,
+  fold constant gains, simplify gain/delay compositions at the dialect level before lowering.
+  Minor here (single filter stage) but the general mechanism behind the paper's speedups.
