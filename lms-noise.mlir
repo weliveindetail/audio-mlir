@@ -22,9 +22,7 @@
 //   * @mu  (LMS learning rate) -- the LMS lowering loads it once, outside the
 //     per-sample loop, so it stays runtime-tunable AND loop-fusion-safe.
 //   * @wet (noise-cancellation depth) -- the terminal mix does out = d - wet*y
-//     via dsp.gain. gain reloads the 0-D @wet per sample, which the affine-fusion
-//     pass rejects, so this kernel is built WITHOUT --opt (LLVM LICM then hoists
-//     the load anyway). See lms-noise-macOS.sh (OPT defaults to 0 here).
+//     via dsp.gain
 // Runtime noise-color select is NOT wired: the dsp.noise_* ops fix their color at
 // compile time (by op identity), so the color is white here. Making it runtime
 // would need a new noise op that selects the coloring from a scalar.
@@ -32,10 +30,7 @@ module {
   // LMS adaptation rate (interactive, read at render time inside the kernel).
   memref.global "public" @mu : memref<f64> = dense<1.000000e-03>
   // Wet mix (interactive): fraction of the estimated noise to subtract.
-  // 0.0 = noise left in, 1.0 = full cancellation. Applied via dsp.gain in the
-  // terminal mix loop; because gain reloads this 0-D global per sample, the
-  // kernel is built WITHOUT --opt (the affine-fusion pass rejects the in-loop
-  // rank-0 load). LLVM's LICM still hoists the load out of the loop.
+  // 0.0 = noise left in, 1.0 = full cancellation.
   memref.global "public" @wet : memref<f64> = dense<1.000000e+00>
 
   dsp.func @run(%out: memref<44100xf64>) attributes {llvm.emit_c_interface} {
