@@ -15,12 +15,14 @@
 //
 //   Up / Down arrows  -> @wet:        how much of the estimated noise to remove
 //                                     (0 = noise back in, 1 = clean tone).
-//   Left / Right arrows -> @noise_kind: cycle the noise *color* the kernel
-//                                     generates -- white / pink / brown / OU.
 //
-// The noise reference is generated in-kernel from an LCG stream, optionally
-// colored by the pink/brown/OU recurrences (the same math the dsp.noise_*
-// dialect ops encode); no RNG primitive or host-fed data is needed.
+// The @noise_kind color-select knob is disabled: the dsp.noise_* ops fix their
+// color at compile time, so the kernel emits white noise only. The Left/Right
+// handling below is commented out until a runtime-color noise op exists.
+//
+// The noise reference is generated in-kernel from an LCG stream (the same math
+// the dsp.noise_white dialect op encodes); no RNG primitive or host-fed data is
+// needed.
 
 const double SAMPLE_RATE = 44100.0;
 
@@ -42,11 +44,12 @@ struct MemRefDescriptor1D {
 extern "C" void _mlir_ciface_run(MemRefDescriptor1D *out);
 extern "C" double mu;         // the DSL's @mu global (LMS step size, fixed here)
 extern "C" double wet;        // @wet: how much of the noise estimate to subtract
-extern "C" double noise_kind; // @noise_kind: 0=white 1=pink 2=brown 3=ou
+// extern "C" double noise_kind; // @noise_kind: 0=white 1=pink 2=brown 3=ou
+//                               // disabled: kernel emits white noise only.
 
 // Number of selectable noise colors and their display names.
-constexpr int NUM_KINDS = 4;
-static const char *kKindNames[NUM_KINDS] = {"white", "pink", "brown", "ou"};
+// constexpr int NUM_KINDS = 4;
+// static const char *kKindNames[NUM_KINDS] = {"white", "pink", "brown", "ou"};
 
 // Render one batch by invoking the kernel, which reads the current globals.
 static void fillBatch(double *buf, size_t n) {
@@ -99,13 +102,10 @@ void enableRawMode() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
-// Reprint the single status line (wet % and current noise color).
+// Reprint the single status line (wet %).
 static void printStatus() {
-    int kind = static_cast<int>(noise_kind);
-    if (kind < 0) kind = 0;
-    if (kind >= NUM_KINDS) kind = NUM_KINDS - 1;
-    printf("\rNoise reduction: %3.0f%%   |   Noise color: %-6s   ",
-           wet * 100.0, kKindNames[kind]);
+    printf("\rNoise reduction: %3.0f%%   |   Noise color: white   ",
+           wet * 100.0);
     fflush(stdout);
 }
 
@@ -201,7 +201,7 @@ int main() {
     // and stay converged. Start fully wet (noise removed) with white noise.
     mu = 0.001;
     wet = 1.0;
-    noise_kind = 0.0; // white
+    // noise_kind = 0.0; // disabled: kernel emits white noise only
     regenerate();
 
     if (AudioOutputUnitStart(outputUnit) != noErr) {
@@ -219,8 +219,6 @@ int main() {
     std::cout << "    of it to remove and which color of noise to fight." << std::endl;
     std::cout << " -> [UP Arrow]    add cancellation (toward a clean tone)" << std::endl;
     std::cout << " -> [DOWN Arrow]  back it off (bring the interference back)" << std::endl;
-    std::cout << " -> [RIGHT Arrow] next noise color  (white -> pink -> brown -> ou)" << std::endl;
-    std::cout << " -> [LEFT Arrow]  previous noise color" << std::endl;
     std::cout << " -> [Q] or Ctrl+C to stop the program safely" << std::endl;
     std::cout << "==============================================\n" << std::endl;
 
@@ -240,15 +238,16 @@ int main() {
                     } else if (seq[1] == 'B') { // Down: less cancellation
                         wet = std::max(0.0, wet - 0.05);
                         printStatus();
-                    } else if (seq[1] == 'C') { // Right: next noise color
-                        int k = (static_cast<int>(noise_kind) + 1) % NUM_KINDS;
-                        noise_kind = static_cast<double>(k);
-                        printStatus();
-                    } else if (seq[1] == 'D') { // Left: previous noise color
-                        int k = (static_cast<int>(noise_kind) + NUM_KINDS - 1) % NUM_KINDS;
-                        noise_kind = static_cast<double>(k);
-                        printStatus();
                     }
+                    // Left/Right noise-color select disabled (white-only kernel):
+                    // } else if (seq[1] == 'C') { // Right: next noise color
+                    //     int k = (static_cast<int>(noise_kind) + 1) % NUM_KINDS;
+                    //     noise_kind = static_cast<double>(k);
+                    //     printStatus();
+                    // } else if (seq[1] == 'D') { // Left: previous noise color
+                    //     int k = (static_cast<int>(noise_kind) + NUM_KINDS - 1) % NUM_KINDS;
+                    //     noise_kind = static_cast<double>(k);
+                    //     printStatus();
                 }
             }
         }
