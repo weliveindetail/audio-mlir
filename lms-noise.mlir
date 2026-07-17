@@ -59,10 +59,15 @@ module {
   // be wrapped mod 44100, one exact tone period, for indefinite exactness).
   memref.global "public" @sample_offset : memref<i64> = dense<0>
   // Low-pass cutoff-LFO period in samples (interactive): the automation speed.
-  // The triangle sweep below is `@sample_offset mod @lfo_period`, so a smaller
-  // period = faster sweep (LFO Hz = 44100 / period; default 147000 ≈ 0.3 Hz).
-  // The host writes this from the +/- keys; must stay > 0 (host clamps it).
+  // A smaller period = faster sweep (LFO Hz = 44100 / period; default 147000 ≈
+  // 0.3 Hz). The host writes this from the +/- keys; must stay > 0 (host clamps).
   memref.global "public" @lfo_period : memref<i64> = dense<147000>
+  // Cutoff-LFO phase accumulator, one cycle = [0,1). Each @run advances it by
+  // N/@lfo_period and stores it back, so changing @lfo_period only changes the
+  // per-block *increment*, never the accumulated phase -- rate changes are then
+  // click-free (unlike `offset mod period`, which jumps the phase when period
+  // changes). Store 0 to restart the sweep from its muffled edge.
+  memref.global "public" @lfo_phase : memref<f64> = dense<0.000000e+00>
 
   // BLOCK SIZE: N = 128 samples per @run call (~2.9 ms at 44100). Small on
   // purpose: parameters are read once per call (control-rate == block-rate), so
@@ -178,15 +183,24 @@ module {
     // filtered tone is continuous across calls (no per-block click). Applied to
     // the sawtooth here (the signal path), so the sweep is audible as a timbral
     // change, not just amplitude. Triangle is pure arith (|2f-1| via cmp/select).
-    %lpPmem = memref.get_global @lfo_period : memref<i64>  // interactive sweep speed
-    %lpP    = memref.load %lpPmem[] : memref<i64>         // LFO period (samples)
-    %lpPf   = arith.sitofp %lpP : i64 to f64
-    %lpph   = arith.remsi %offval, %lpP : i64             // phase 0..P-1
-    %lpphf  = arith.sitofp %lpph : i64 to f64
-    %lpfrac = arith.divf %lpphf, %lpPf : f64              // 0..1
     %lp2    = arith.constant 2.000000e+00 : f64
     %lp1    = arith.constant 1.000000e+00 : f64
     %lp0    = arith.constant 0.000000e+00 : f64
+    %lpPmem = memref.get_global @lfo_period : memref<i64>  // interactive sweep speed
+    %lpP    = memref.load %lpPmem[] : memref<i64>         // LFO period (samples)
+    %lpPf   = arith.sitofp %lpP : i64 to f64
+    // Phase accumulator: read the persistent 0..1 phase, use it for THIS block,
+    // then advance by N/period and store back. Since only the increment depends
+    // on @lfo_period, changing the sweep speed never jumps the phase (click-free).
+    %phmem  = memref.get_global @lfo_phase : memref<f64>
+    %lpfrac = memref.load %phmem[] : memref<f64>          // current phase 0..1
+    %blkf   = arith.constant 1.280000e+02 : f64           // N (block size)
+    %lpinc  = arith.divf %blkf, %lpPf : f64               // cycles advanced per block (<1)
+    %phraw  = arith.addf %lpfrac, %lpinc : f64
+    %phge1  = arith.cmpf oge, %phraw, %lp1 : f64          // wrap: inc<1 so one subtract suffices
+    %phsub  = arith.subf %phraw, %lp1 : f64
+    %phnext = arith.select %phge1, %phsub, %phraw : f64   // wrap to 0..1
+    memref.store %phnext, %phmem[] : memref<f64>
     %lp2f   = arith.mulf %lpfrac, %lp2 : f64
     %lp2fm1 = arith.subf %lp2f, %lp1 : f64               // -1..1
     %lpneg  = arith.negf %lp2fm1 : f64
