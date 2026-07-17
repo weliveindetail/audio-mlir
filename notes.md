@@ -1,133 +1,166 @@
 # Research Notes
 
-## Uncertainty algebra (a probabilistic MLIR type -- opportunities & challenges)
+## The `dsp` dialect (work in progress)
 
-Motivated by the `noise-lang` DSL (in `../noise-lang`), where every value is a *random
-variable* (a probability distribution), operators lift over random variables, and `P(cond)` /
-`E(x)` estimate probabilities and expectations by Monte Carlo. The question: could we bring that
-"uncertainty algebra" into DSP-MLIR as a first-class type or dialect? This section records the
-design of that ambitious track ("B") so we don't lose the reasoning. The concrete, shippable
-piece ("A" -- noise *signal* generators) is separate and is implemented in the `dsp` dialect;
-see `dsp.noise_white/pink/brown/ou` and `noise-kinds.mlir`.
+We are adapting the [DSP-MLIR](https://arxiv.org/abs/2408.11205) `dsp` dialect for
+audio processing. Upstream `dsp` is a large library of block/vector DSP ops (FFT/DFT,
+FIR/IIR filters, windowing, correlation, DTMF/QAM, ...); on top of it we added and
+adjusted ops for **continuous, block-wise audio that carries state across calls**. The
+audio-relevant stateful additions are the colored-noise generators `dsp.noise_white` /
+`noise_pink` / `noise_brown` / `noise_ou`, the `dsp.delay` line, and the adaptive
+`dsp.lmsFilterResponse`; the samples build pipelines from these plus stateless blocks
+like `dsp.getRangeOfVector` (ramp/broadcast), `dsp.mul/add/sub/div/modulo`, `dsp.sin`,
+`dsp.gain`, `dsp.hamming`, `dsp.lowPassFIRFilter`, `dsp.FIRFilterResponse`, and the
+runtime selector `dsp.index_switch` / `dsp.yield`. Three properties define the WIP design:
 
-### The idea
+- **Tensor-based, bufferization-pass-free.** Every `dsp` op operates on `tensor`s in the
+  frontend and stays in tensor land through inlining/shape inference. There is no general
+  bufferization pass by design: each op only bufferizes inside its own `ConversionPattern`
+  during affine lowering (`LowerToAffineLoops.cpp`), allocating/deallocating its memrefs
+  locally. Keeping the pipeline at the tensor level is what enables the domain-specific
+  (Axis B) rewrites listed under Performance Improvements below.
+- **Block-wise processing with carried state.** Under `--stream`, a
+  `StreamStateMaterialization` pass runs just before affine lowering and gives every
+  stateful op instance its own module-scope `memref.global` state buffer (noise gens: LCG
+  seed + colored-filter accumulators; `dsp.delay`: a K-sample history line;
+  `dsp.lmsFilterResponse`: the adaptive tap weights). The kernel's C entry point
+  `_mlir_ciface_run` is then called once per block and each call resumes where the last
+  left off. State is **not** threaded through the `@run` signature, which stays
+  `run(%out: memref<Nxf64>)`. Ops inside a `dsp.index_switch` region get independent
+  per-case state; ops outside share one global each.
+- **Loop fusion after bufferization.** `--opt` runs, after affine lowering,
+  canonicalize + CSE, an `AffineFusionLegalityPass` guard, then affine loop fusion and
+  affine scalar replacement. The legality pass rejects (with a clear diagnostic) the one
+  pattern that used to crash fusion: a 0-D/scalar memref loaded *inside* an elementwise
+  loop, e.g. `dsp.gain`'s broadcast. The samples avoid it by broadcasting scalars to
+  vectors with `getRangeOfVector` instead of `dsp.gain`.
 
-A new type, e.g. `!dsp.rv<f64>`, denoting a random variable rather than a value. Arithmetic ops
-lift over it (`add(rv, rv) -> rv`), distribution ops introduce it (`dsp.sample_normal %mu, %sigma
-: !dsp.rv<f64>`), and *query* ops collapse it back to a number by simulation:
-`dsp.prob %cond -> f64`, `dsp.expect %x -> f64`, `dsp.variance %x -> f64`. A query lowers to a
-Monte-Carlo loop: draw N samples, evaluate the random variable's def-use subgraph with fresh
-draws at the sample sites, and reduce (mean / fraction-true / variance).
+Compiler-side code lives in `../DSP_MLIR/mlir/examples/dsp/SimpleBlocks` (ops in
+`include/toy/Ops.td`; lowering + the stream/fusion passes in `mlir/LowerToAffineLoops.cpp`;
+driver in `toyc.cpp`). This repo (`samples/`) holds only demos and docs.
 
-### Opportunities (why MLIR is a surprisingly good host)
+## Using the `dsp1` compiler
 
-- **SSA *is* noise-lang's sharing rule.** noise-lang's load-bearing rule is "one name = one
-  fixed draw; every mention reuses it" (`X - X == 0`, `X + X == 2X`). In MLIR an SSA value is
-  exactly one node shared by all its uses. So the def-use graph already encodes the sharing
-  semantics for free; independence = two distinct `sample` ops (mirrors noise-lang's two `~`
-  bindings), and `~[n]` maps to a vector/shaped result.
-- **The query is a clean lowering, not a new runtime.** `dsp.prob`/`dsp.expect` lower to an
-  ordinary affine/scf loop over the backward slice of the queried value, RNG at the sample ops,
-  reduction at the end -- the same machinery the dialect already uses. It JITs/AOTs like any
-  other kernel; no interpreter.
-- **Distributions compose with the existing DSP ops.** Because the RV lifts through arithmetic,
-  you can push a random noise source through a filter and query the *output* statistics -- e.g.
-  `E[residual power]` after the LMS canceller, or `P(SNR > threshold)` -- reusing `dsp.filter`,
-  `dsp.fft`, etc. unchanged.
-- **Analysis passes have real semantics to exploit.** Constant sub-expressions fold eagerly
-  (a point mass), independent-sum variance is additive, affine transforms of a Gaussian stay
-  Gaussian -- a dialect could rewrite some queries to closed form instead of sampling.
+The driver is the SimpleBlocks example built as the CMake target `dsp1` (source
+`toyc.cpp`): `ninja -C ../build-relwithdebinfo dsp1` produces
+`../build-relwithdebinfo/bin/dsp1`. The sample scripts prepend that `bin/` to `PATH` and
+invoke `dsp1 <pipeline>.mlir --emit=<target> [flags] [-o out]`.
 
-### Challenges (and the honest scope limit)
+- **Input** is a `.mlir` file in the `dsp` dialect (see `osc-low-pass.mlir`,
+  `lms-noise.mlir`). The pipeline entry is
+  `dsp.func @run(%out: memref<Nxf64>) attributes {llvm.emit_c_interface}`; interactive
+  knobs are `memref.global "public"` symbols (`@cutoff`, `@wet`, `@noise_kind`, `@mu`)
+  that the host reads/writes between calls. Passing a `.dsp` source instead needs `-x dsp`.
+- **`--emit=` targets** (verified via `dsp1 --help-hidden`): `ast`, `mlir` (dsp dialect as
+  parsed), `mlir-affine` (after lowering -- inspect generated loops/allocs), `mlir-linalg`,
+  `mlir-llvm`, `llvm` (LLVM IR text), `llvm-hexagonv68`, `wasm` (a `.wasm` object), `jit`
+  (compile and run in-process via `main`).
+- **Flags:** `--opt` enables the fusion/scalar-replacement pipeline above; `--stream`
+  enables `StreamStateMaterialization` for cross-call state; `-o <file>` sets the output
+  (default stdout, for `--emit=llvm/wasm`). `--affineIn`, `--affineOpt`, `--canonOpt`
+  exist for partial pipelines.
 
-- **Sequential/stateful processes are out of scope -- which is exactly what LMS is.** noise-lang
-  is explicit: it samples independent lanes that *cannot carry state across a time index* (no
-  random walks, Markov chains, queues). The adaptive filter in `lms-noise.mlir` is a per-sample
-  weight recurrence `w[n] = w[n-1] + mu*e[n]*x[n-i]` -- precisely a stateful time recurrence. So
-  the RV algebra **cannot express the canceller's core**; it can only *wrap* it (run the
-  deterministic kernel over an RV noise source across many seeds and estimate output stats).
-  This is the key reason A and B are different layers: A generates the samples, B characterizes
-  the pipeline built on them.
-- **Type-system surface.** `!dsp.rv<T>` needs lifting rules for every arithmetic/comparison op,
-  a bool-RV for conditions, and a conditioning form (`X | C`). That is a lot of ODS + verifier
-  work orthogonal to the current deterministic tensor DSP.
-- **Cost model & seeding.** Each query is an N-sample pass (default 1e6 in noise-lang). Nested
-  queries multiply. Reproducibility needs a threaded, well-defined seed per sample site. Shared
-  vs. independent draws must be tracked precisely or the estimates are silently wrong.
-- **Cross-query consistency isn't free.** As in noise-lang, `P(A)`, `P(B)`, `P(A&&B)` estimated
-  in separate passes need not satisfy `P(A&&B) <= P(A)`; a serious implementation shares one
-  sampling pass per query and rejection-conditions within it.
-- **No scaling inference.** Forward Monte Carlo + rejection conditioning only; importance
-  sampling / MCMC (needed to condition on continuous data) is a further track, same as
-  noise-lang's own roadmap.
+Native build flow (what `bench.sh` and `*-macOS.sh` do):
+`dsp1 pipeline.mlir --emit=llvm [--stream] [--opt] -o k.ll`
+→ `llc k.ll -filetype=obj -o k.o`
+→ `clang++ host.cpp k.o ... -o app`.
+The host links the `_mlir_ciface_run` symbol and calls it (per block under `--stream`). For
+the browser demo, `--emit=wasm` then `wasm-ld --export=_mlir_ciface_run --export=<knobs>`
+(see `sample-wasm.sh`). To inspect a pipeline without a host:
+`dsp1 pipeline.mlir --emit=mlir-affine --opt`.
 
-### Verdict
+## Uncertainty algebra (a deferred probabilistic-type track)
 
-B is a legitimate and elegant MLIR dialect (SSA fits the sharing model beautifully), but it
-*characterizes* stochastic pipelines rather than *generating* them, and it structurally can't
-model the LMS recurrence. So it is deferred. What actually helps `lms-noise.mlir` today is A:
-first-class colored-noise **signal generators** in the `dsp` dialect, which is what the rest of
-this work implements.
+Context for a design we deliberately did **not** build, kept so the reasoning isn't lost.
+Motivated by the `noise-lang` DSL (`../noise-lang`), where every value is a *random
+variable* and `P(cond)` / `E(x)` are estimated by Monte Carlo, the idea was a first-class
+`!dsp.rv<f64>` type: arithmetic ops lift over it, `dsp.sample_normal` introduces it, and
+query ops (`dsp.prob`/`expect`/`variance`) collapse it back to a number by lowering to an
+ordinary affine/scf sampling loop. MLIR is a surprisingly good host: SSA already encodes
+noise-lang's "one name = one fixed draw" sharing rule; a query is a clean lowering, not a
+new runtime; and RVs compose with the existing `dsp` ops (e.g. `E[residual power]` after
+the LMS canceller).
 
-## Batch-and-stream C++ implementation
+Why it stays deferred: the algebra **cannot express stateful time recurrences**, which is
+exactly what our audio ops are. noise-lang samples independent lanes with no state across a
+time index, whereas the LMS update `w[n] = w[n-1] + mu*e[n]*x[n-i]` and the delay/noise
+streams are precisely such recurrences. The RV type could only *wrap* the deterministic
+kernel (run it over many seeds and estimate output statistics), not model its core. Given
+that, plus the large ODS/verifier surface to lift every op and the seeding/cost-model work,
+it isn't worth it now. What actually helps the audio pipeline -- first-class colored-noise
+**signal generators** in the `dsp` dialect -- is already implemented
+(`dsp.noise_white/pink/brown/ou`, `noise-kinds.mlir`).
 
-- f64→f32 on copy: AudioCallback reads double samples from the published batch and casts to
-float per-sample into the CoreAudio buffers.
-- Batch-and-stream: regenerate() renders a full 1-second batch into the back buffer via the
-kernel, then atomically swaps it in. The audio thread streams from gActive with
-wraparound; the keyboard thread triggers a regenerate on each arrow press.
-- Thread safety: single std::atomic<double*> pointer swap (acq/rel) publishes a
-fully-rendered buffer; no torn reads.
+## Block-based processing -- status
 
-## Moving to block-based processing later
+Block-wise streaming now works via module-scope state globals (`--stream` +
+`StreamStateMaterialization`, above) rather than the extra state *parameters* this section
+originally predicted: `@run` stays `run(%out)` and state lives in globals, not in a grown
+`run(out, n, fc, phase_in_out, hist_in_out)` ABI. What that machinery covers and what it
+still does **not**:
 
-The current design recomputes a whole second of audio on every cutoff change and loops it.
-Block-based means the kernel produces exactly inNumberFrames of fresh audio per audio
-callback, with continuity across calls. That requires carrying state the current run(out,
-fc) kernel doesn't have:
+- **Covered:** per-op stream state for the stateful ops. `dsp.delay` keeps its K-sample
+  history line, `dsp.lmsFilterResponse` keeps its adaptive weights, and the noise
+  generators keep their LCG/colored-filter state. This is what makes the LMS canceller
+  (`lms-noise.mlir`) seamless across calls.
+- **Unaddressed -- oscillator/tone phase continuity.** Both samples build the time base
+  with `getRangeOfVector(0, N, dt)`, i.e. every call restarts at `t = 0`. No phase is
+  carried as state, so a *streamed* sine/sawtooth clicks at each block boundary.
+  `osc-low-pass.mlir` flags this in a comment ("Consider switching to phase when moving on
+  to block-based processing"). The fix is a stateful phase (start-offset in, phase-out).
+- **Unaddressed -- FIR overlap-save history.** `dsp.FIRFilterResponse` is *not* a stateful
+  op: it has no per-block history global and emits the full `len + N - 1` linear
+  convolution. Streaming it block-by-block would corrupt the leading N-1 samples of each
+  block. `lms-noise.mlir` sidesteps this because its acoustic path is built from stateful
+  `dsp.delay` ops and the LMS filter, not `FIRFilterResponse`. Overlap-save history for the
+  FIR is the biggest open piece for a truly block-based low-pass.
+- **Unaddressed -- coefficient crossfade on cutoff change.** Windowed-sinc taps are cheap
+  to recompute per call, but swapping them instantaneously causes a small discontinuity; a
+  crossfade between old/new coefficient sets is not implemented (acceptable for the demo).
 
-1. Oscillator phase continuity. Right now getRangeOfVector(0, 44100, dt) always starts at
-t=0. Across blocks the sine must not restart, or you get a click every block. The kernel
-needs a phase (or sample-index) input/output: take phase_in, generate n samples starting
-there, and write back phase_out. In the DSL that's a start offset added to the time vector;
-at the ABI level it's an extra double* in/out parameter (or a returned scalar).
+## Feedforward tensor ops vs. feedback scan ops (the state model that scales)
 
-2. FIR filter state (the hard part). A 101-tap FIR convolution needs the previous N−1 = 100
-input samples to compute the first outputs of the new block — otherwise each block's
-leading 100 samples are wrong and you hear edge artifacts at every boundary. The standard
-fix is overlap-save: keep a 100-sample history of the oscillator signal, prepend it to the
-new block, convolve, and discard the transient. So the kernel needs a second caller-owned
-state buffer (hist[100]) that it reads at entry and updates at exit.
+The dialect splits cleanly into two categories by whether an op's output feeds back into
+itself. This split decides what can stay pure tensor math and what needs a carried-state
+loop, and it's the mental model to design new ops around.
 
-3. Cutoff changes mid-stream. Recomputing the windowed-sinc coefficients every block
-(cheap, 101 taps) is fine, but changing coefficients instantaneously causes a small
-discontinuity. Acceptable for a demo; a crossfade between old/new coefficient sets removes
-it.
+- **Feedforward / closed-form / bounded-history -> pure tensor math.** Oscillators
+  (sin/saw/chirp), envelopes (exp), FIR/convolution, `delay`, gain, mixers, waveshapers.
+  The output is a function of the time index or of the input with a *bounded* look-back, so
+  a block is an embarrassingly-parallel map. Cross-call state is at most a single scalar (a
+  phase / sample offset) or the last N-1 input samples (overlap-save). This is the class
+  that fuses and vectorizes, and where the Axis-B rewrites apply. `dsp.delay` is the
+  bounded-history example (carries K samples). A stateful oscillator/time base is the
+  scalar-state example: `sin(2*pi*f*t[n])` is pure math *because sine has a closed form in
+  n* -- the only thing carried across blocks is the phase, never a sequential loop.
+- **Feedback / recurrence -> stateful scan op.** IIR/biquad `y[n] = a*y[n-1] + b*x[n]`,
+  one-pole smoothers, integrators, envelope followers, PLLs, and adaptive filters (the LMS
+  weight update `w[n] = w[n-1] + mu*e[n]*x[n-i]`). Here `y[n]` depends on its *own past
+  within the same block*, so there is no elementwise expression; it must lower to a
+  sequential scan (`scf.for` with `iter_args`) carrying the recurrence state. Today each
+  such op is a bespoke hand-rolled loop: `dsp.noise_pink/brown/ou` carry 6 recurrence
+  values, `dsp.lmsFilterResponse` carries its tap weights.
 
-4. Kernel signature growth. run(out, fc) becomes roughly:
-run(out, n, fc, phase_in_out, hist_in_out)
-i.e. the block length n, plus two extra caller-owned state buffers the kernel
-reads-then-writes. On the compiler side this is the same out-param/destination-passing
-machinery you're already building — just more memref arguments threaded through
-FuncOpLowering, no new mechanism.
+**Design direction.** Keep pushing feedforward logic into small composable pure-tensor ops.
+For the feedback class, introduce a shared set of **stateful "scan" ops** -- a general
+`dsp.scan` / linear-recurrence op (or a state-space / biquad op) -- so biquads, smoothers,
+and LMS reuse *one* stateful-loop primitive instead of each being reimplemented. Both
+categories carry their state through the same `StreamStateMaterialization` mechanism (a
+module-scope global per op instance), so block-wise streaming is uniform across them.
 
-5. C++ side. AudioCallback calls run(...) directly with out = ioData (after an f64 scratch
-buffer + convert, since CoreAudio wants f32), n = inNumberFrames, and the persistent
-gPhase/gHist state. The double-buffer/batch scaffolding goes away; the callback does real
-work, so the kernel must stay within the real-time budget (101-tap FIR × ~512 frames is
-trivially fine).
-
-The biggest lift is #2 — the FIR history buffer is what makes blocks seamless, and it's the
-one piece the static DSL pipeline has no concept of today.
+Escape hatch (not needed now): feedback isn't fundamentally stuck in sequential land --
+linear recurrences can be blocked in parallel via an associative scan or a state-space
+transition-matrix form (`y_block = f(state, x_block)`) instead of a naive map. Worth knowing
+the option exists before committing to always-sequential scan lowering.
 
 ## Performance Improvements
 
-The `_run` object we generate today (Toy-tutorial lowering) is one heap buffer + one full
+The `_run` object generated today (Toy-tutorial lowering) is one heap buffer + one full
 loop per DSP op, every scalar constant heap-allocated, ~25 malloc/free per call, a scalar
 bounds-checked convolution, and no fusion. It looks alarming but most of the bloat is
 one-time setup/teardown that is NOT on the hot path.
 
-Flop budget for one regenerate() (44100-sample signal, 101-tap FIR):
+Flop budget for one `regenerate()` (44100-sample signal, 101-tap FIR):
 - ~9 elementwise loops (t, phase, ones, frac, saw2, saw, wc, coef, ...): ~9 x 44100 ~= 0.4M
 - coefficient build (sinc + hamming, with sin/cos): 101 taps, negligible
 - FIR convolution (44200 x up to 101): ~4.5M mul-add  <- ~90% of runtime
@@ -140,10 +173,11 @@ the domain-specific algebraic rewrites the DSP-MLIR paper measures.
 
 ### Measuring
 
-`bench.sh` builds the kernel object and a standalone driver (`bench.cpp`) that links the same
-`_mlir_ciface_run` as the CoreAudio host but strips the audio machinery, so it times ONLY the
-generated kernel. It is decoupled from how the object is built: change a pass/pipeline, rerun
-`./bench.sh`, diff the output. Usage: `./bench.sh [--iterations N] [--warmup N]`.
+`bench.sh` builds the kernel object (from `osc-low-pass.mlir`) and a standalone driver
+(`bench.cpp`) that links the same `_mlir_ciface_run` as the CoreAudio host but strips the
+audio machinery, so it times ONLY the generated kernel. It is decoupled from how the object
+is built: change a pass/pipeline, rerun `./bench.sh`, diff the output. Usage:
+`./bench.sh [--iterations N] [--warmup N]`.
 
 Each run prints a human summary plus one machine-readable line an agent can parse:
 `BENCH_JSON {"min_ms":..,"median_ms":..,"stddev_ms":..,"msample_per_s_median":..,"checksum":..}`.
@@ -152,24 +186,18 @@ Each run prints a human summary plus one machine-readable line an agent can pars
   ~bit-stable; Axis B (numeric rewrites like FFT convolution) should keep it within fp
   tolerance. A changed checksum on an Axis-A change means the optimization broke correctness.
 
-`bench.sh` now builds with `--opt` by default (loop fusion + affine scalar
-replacement); pass `OPT=0 ./bench.sh` to build the plain baseline for an A/B.
-`--opt` used to assert in the affine loop-fusion pass on this kernel; that is
-now fixed -- the sawtooth was rewritten to avoid `dsp.gain`'s 0-D-memref-in-loop
-broadcast, and a new `AffineFusionLegalityPass` (runs right before fusion under
-`--opt`) rejects that pattern with a clear diagnostic instead of crashing.
-
-Baselines on this machine (checksum 1.769572322574197e+01, identical both ways):
+`bench.sh` builds with `--opt` by default; pass `OPT=0 ./bench.sh` to build the plain
+baseline for an A/B. Baselines on this machine (checksum 1.769572322574197e+01, identical
+both ways):
 - plain pipeline (`OPT=0`): min ~3.86 ms, median ~4.05 ms/call, ~11 Msample/s.
-- `--opt` (current default): min ~3.44 ms, median ~3.59 ms/call, ~12 Msample/s
-  (~12% faster). This is the number to beat.
+- `--opt` (default): min ~3.44 ms, median ~3.59 ms/call, ~12 Msample/s (~12% faster). This
+  is the number to beat.
 
-What `--opt` already bought (vs plain): affine.for loops 13->9, memref.alloc
-24->13, 44100-elt intermediate buffers 7->4, 0-D scalar memrefs 49->21. It did
-NOT vectorize (zero NEON fp ops), did NOT hoist the convolution bounds check
-(the `affine.if` zero-pad guard is still in the tap loop), and left 16
-malloc/free in the emitted IR. So the hot-path wins (A1/A2) and all of Axis B
-remain open. See the per-task status below.
+What `--opt` already bought (vs plain): affine.for loops 13->9, memref.alloc 24->13,
+44100-elt intermediate buffers 7->4, 0-D scalar memrefs 49->21. It did NOT vectorize (zero
+NEON fp ops), did NOT hoist the convolution bounds check (the `affine.if` zero-pad guard is
+still in the tap loop), and left 16 malloc/free in the emitted IR. So the hot-path wins
+(A1/A2) and all of Axis B remain open. See the per-task status below.
 
 ### Axis A -- backend codegen quality
 
@@ -332,3 +360,9 @@ Semantics:
   independently is a cross product of clones; decide whether to nest dispatchers
   (product blow-up) or restrict to one switch per kernel initially and diagnose
   the rest. Document the chosen policy when implemented.
+
+DSP session:
+claude --resume 48701461-7c6a-4dd0-a967-120d220de8e7
+
+WASM session:
+claude --resume 9a199408-3c7a-4e8e-ae36-733eb5ad685c
