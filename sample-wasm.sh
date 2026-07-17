@@ -5,13 +5,6 @@ mkdir -p out
 # DSP-MLIR kernels
 PATH=$(pwd)/../build-relwithdebinfo/bin:$PATH
 
-# Low-pass sawtooth: interactive @cutoff global.
-dsp1 osc-low-pass.mlir --emit=wasm -o out/osc-low-pass.wasm
-wasm-ld --no-entry --import-memory --allow-undefined \
-        --export=run --export=_mlir_ciface_run --export=cutoff \
-        --export=__wasm_call_ctors --export=__heap_base --export=__data_end \
-        out/osc-low-pass.wasm -o sample-wasm/osc-low-pass.linked.wasm
-
 # LMS adaptive noise canceller: interactive @mu/@wet/@noise_kind globals,
 # plus @lms_weights (persistent adaptive-filter state).
 dsp1 lms-noise.mlir --emit=wasm -o out/lms-noise.wasm

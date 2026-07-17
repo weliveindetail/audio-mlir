@@ -38,28 +38,10 @@
 <main>
   <h1>audio-mlir samples in WebAssembly</h1>
   <p class="sub">
-    Two DSP-MLIR kernels compiled to WASM (relocatable object → <code>wasm-ld</code>),
+    A DSP-MLIR kernel compiled to WASM (relocatable object → <code>wasm-ld</code>),
     driven from JS over the same memref ABI as the native <code>sample-macOS.cpp</code>
     host: a <code>MemRefDescriptor1D</code> in linear memory plus shared parameter globals.
   </p>
-
-  <section class="panel" id="lpPanel">
-    <h2>Low-Pass Sawtooth</h2>
-    <p class="desc">
-      A 440&nbsp;Hz sawtooth fed through a 101-tap windowed-sinc low-pass FIR.
-      The <code>@cutoff</code> global sweeps the corner frequency.
-    </p>
-    <div class="row">
-      <button id="lpStart" class="primary">▶ Start audio</button>
-      <button id="lpStop" disabled>■ Stop</button>
-    </div>
-    <div class="row">
-      <label for="cutoff">Cut-off</label>
-      <input type="range" id="cutoff" min="40" max="15000" step="20" value="1000" disabled />
-      <span class="val" id="cutoffVal">1000 Hz</span>
-    </div>
-    <div class="status" id="lpStatus">Ready</div>
-  </section>
 
   <section class="panel" id="lmsPanel">
     <h2>LMS Adaptive Noise Canceller</h2>
@@ -103,8 +85,8 @@
 //   • malloc/free/memcpy/fmod/sin/cos   → supplied here from JS / Math
 //   • run, _mlir_ciface_run, <globals>  → exported
 // The kernel calls only *our* malloc for its scratch tensors, so we fully
-// control the linear-memory layout. Exported parameter globals (cutoff / mu /
-// wet / noise_kind …) are immutable i32 globals holding the *address* of the
+// control the linear-memory layout. Exported parameter globals (mu / wet /
+// noise_kind …) are immutable i32 globals holding the *address* of the
 // underlying f64 in linear memory, which we read and write directly.
 // ---------------------------------------------------------------------------
 const SAMPLE_RATE = 44100;
@@ -267,28 +249,6 @@ function wirePanel({ kernel, synth, startBtn, stopBtn, statusEl, controls }) {
       timer = setTimeout(() => { timer = null; synth.swap(); }, 60);
     });
   }
-}
-
-// ---- Low-pass sawtooth kernel ---------------------------------------------
-{
-  const BATCH = 44200, LOOP = 44100;           // 44100 signal + (101-tap FIR − 1) tail
-  const kernel = createKernel({ url: 'osc-low-pass.linked.wasm',
-    batchSamples: BATCH, loopSamples: LOOP, firTail: BATCH - LOOP });
-  const synth = createSynth(kernel, { loopSamples: LOOP, master: 0.8 });
-
-  const cutoff = document.getElementById('cutoff');
-  const cutoffVal = document.getElementById('cutoffVal');
-  wirePanel({
-    kernel, synth,
-    startBtn: document.getElementById('lpStart'),
-    stopBtn:  document.getElementById('lpStop'),
-    statusEl: document.getElementById('lpStatus'),
-    controls: [{
-      el: cutoff,
-      apply: () => { const hz = +cutoff.value; cutoffVal.textContent = `${hz} Hz`;
-        kernel.setParam('cutoff', hz); },
-    }],
-  });
 }
 
 // ---- LMS adaptive noise canceller kernel ----------------------------------
