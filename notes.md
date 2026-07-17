@@ -114,22 +114,65 @@ still does **not**:
   `getRangeOfVector(0, N, dt)` idiom and hasn't been converted, so a streamed sawtooth there
   would still click.
 - **Addressed (lms-noise) -- small block size + block-synchronous host.** The kernel block is
-  now N=512 samples per `@run` call (was 44100 = one second); only the tensor/memref shapes
-  and the `%n`/`%cnt` count constants change. The CoreAudio host (`lms-noise-macOS.cpp`) was
-  reworked to match: the old double-buffer + 100 ms `regenerate` + wraparound loop is replaced
-  by a background render thread that produces 512-sample blocks into a lock-free SPSC ring
-  buffer, drained by the audio callback (the kernel still does ~16 malloc/free per call, so it
-  is not RT-safe to invoke inside the callback). No host-side loop remains -- `--stream` state
-  and `@sample_offset` make each block the true next 512 samples. The host also pins the
-  hardware buffer to 512 frames (`kAudioDevicePropertyBufferFrameSize` +
-  `kAudioUnitProperty_MaximumFramesPerSlice`); the ring makes playback correct even if the OS
-  renegotiates a different slice size.
-- **Unaddressed -- LMS input-history continuity (item 3).** `dsp.lmsFilterResponse` persists
-  only its 32 adaptive weights across calls, not the last 31 input samples the FIR sum needs:
-  its `iv - iv2 >= 0` guard zero-pads at each block start, so the first ~31 outputs of every
-  block carry a small transient. Inaudible at N=44100 (one per second), but audible at N=512
-  (~86 per second). Fixing it needs a per-instance input-history global (the same overlap-save
-  state the FIR below wants), deferred to a separate step.
+  now N=128 samples per `@run` call (was 512, originally 44100 = one second); only the
+  tensor/memref shapes and the `%n`/`%cnt` count constants change. 128 samples ≈ 2.9 ms ≈ a
+  344 Hz block rate, small enough that once-per-block ("control-rate") parameter automation
+  stays smooth. The CoreAudio host (`lms-noise-macOS.cpp`) was reworked to match: the old
+  double-buffer + 100 ms `regenerate` + wraparound loop is replaced by a background render
+  thread that produces 128-sample blocks into a lock-free SPSC ring buffer, drained by the
+  audio callback. No host-side loop remains -- `--stream` state and `@sample_offset` make each
+  block the true next 128 samples. The host also pins the hardware buffer
+  (`kAudioDevicePropertyBufferFrameSize` + `kAudioUnitProperty_MaximumFramesPerSlice`); the
+  ring makes playback correct even if the OS renegotiates a different slice size.
+- **Addressed (lms-noise) -- automated control-rate parameter.** The demo now ends with a
+  one-pole low-pass (`dsp.lowPassFilter`, a stateful op with a `memref<1xf64>` `state` global
+  holding `y[n-1]`) whose cutoff coefficient `alpha` is *automated* in-kernel: a pure-arith
+  triangle LFO over `@sample_offset` (period 147000 samples ≈ 3.3 s) sweeps alpha in
+  [0.02, 0.35]. alpha is read once per block (control-rate), matching the "read params before
+  loops, not inside them" rule; the LFO is deterministic in the sample counter, so it is
+  walltime-insensitive like the rest of the kernel. Demonstrates block-rate automation without
+  any host knob.
+- **Addressed (lms-noise) -- zero heap per call (RT-safe kernel).** `insertAllocAndDealloc`
+  now stack-promotes any statically-shaped buffer ≤ 64 KiB to `memref.alloca` (hoisted to the
+  function entry block, no dealloc) instead of `memref.alloc`+`memref.dealloc`. At N=128 every
+  buffer (≤ 1 KiB for a 128×f64) qualifies, so the emitted `.ll` has **0 malloc / 0 free**
+  (was ~16 pairs per call). The last holdout was the `scf.index_switch` (noise-color selector)
+  result: its post-conversion fix-up in `ToyToAffineLoweringPass` used to unconditionally emit
+  one `memref.dealloc` on the switch result at the end of the block. Now that the case regions
+  yield stack allocas, that dealloc is both a stray `free` and undefined (freeing a stack
+  pointer); the fix-up only emits it for results every region yields via a heap `memref.alloc`.
+  The kernel is now safe to call from the audio callback, though the host still uses the ring
+  for slice-size decoupling.
+- **Addressed (lms-noise) -- compile-time malloc-free guarantee (on by default).** Zero heap
+  *for this kernel at N=128* is not by itself a guarantee: buffers over the 64 KiB stack-
+  promotion threshold, the handful of op lowerings that create `memref.alloc` directly
+  (bypassing `insertAllocAndDealloc`), dynamically-shaped buffers, and heap results escaping an
+  `scf.index_switch` would all still malloc. A verification pass (`AssertNoHeapAllocPass`,
+  module-level) runs **by default** for any runnable target (`--emit=llvm` and beyond), after
+  affine lowering but before memref->LLVM, and fails the compile (exit 4) if *any* `memref.alloc`
+  survives -- checking the actual emitted IR rather than reasoning about sizes, so it catches
+  every source. The error points at the offending op's source location. So a future edit that
+  reintroduces a heap buffer (e.g. bumping N past 8192, or adding a non-promoted op) breaks the
+  build instead of silently regressing real-time safety.
+  `--allow-heap` lifts the requirement: it downgrades the hard error to a warning (same message,
+  ` (allowed by --allow-heap)` suffix) so the kernel still builds, just no longer guaranteed
+  RT-safe -- useful for offline/large kernels (e.g. `osc-low-pass.mlir`'s 44200-sample buffers).
+  NB: toyc registers no MLIR diagnostic handler, so the default engine drops warnings and prints
+  only errors; the pass therefore prints the `--allow-heap` warning to stderr itself, in the
+  same `<loc>: warning: ...` shape. (Sanity-checked: lms-noise N=128 passes by default;
+  osc-low-pass fails by default and builds-with-5-warnings under `--allow-heap`.)
+- **Addressed (lms-noise) -- LMS input-history continuity (item 3).** `dsp.lmsFilterResponse`
+  now carries a *second* per-instance stream-state global (`state_hist`, alongside the weights
+  `state`): a `memref<(taps-1)xf64>` holding the previous block's last `taps-1` input samples.
+  `StreamStateMaterializationPass` materializes it and the op's lowering wires it in: the two
+  FIR loops gained an `else` branch on their `n - i >= 0` guard that, when `n - i < 0`, reads
+  `history[(taps-1) + n - i]` instead of zero-padding, and a small tail loop after the sample
+  loop saves `x[N-(taps-1) .. N-1]` back into the history for the next call. So the FIR sum
+  reaches into the real prior block at boundaries -- the per-block edge transient (the ~86 Hz
+  buzz at N=512) is gone, and even the old once-per-second glitch at N=44100 disappears. Zero-
+  initialized, so the very first block still zero-pads (nothing precedes the stream); the
+  non-streaming path is unchanged (no `state_hist` -> old behavior). This is exactly the
+  overlap-save history the stateless FIR below still lacks.
 - **Unaddressed -- FIR overlap-save history.** `dsp.FIRFilterResponse` is *not* a stateful
   op: it has no per-block history global and emits the full `len + N - 1` linear
   convolution. Streaming it block-by-block would corrupt the leading N-1 samples of each

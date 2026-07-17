@@ -19,6 +19,9 @@ PATH=$(pwd)/../build-relwithdebinfo/bin:$PATH
 
 OPT_FLAG=--opt
 if [ "${OPT:-1}" = "0" ]; then OPT_FLAG=; fi
+# The malloc-free guarantee is on by default: dsp1 fails the build if the kernel
+# would malloc at runtime, so the streamed kernel is real-time safe (callable from
+# the audio callback). Pass --allow-heap to downgrade that error to a warning.
 dsp1 "$KERNEL" --stream --emit=llvm $OPT_FLAG -o "$STEM-native.ll"
 llc "$STEM-native.ll" -filetype=obj -o "$STEM-native.o"
 
