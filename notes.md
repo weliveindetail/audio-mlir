@@ -1,6 +1,6 @@
 # Research Notes
 
-## The `dsp` dialect (work in progress)
+## The `dsp` dialect for audio (work in progress)
 
 We are adapting the [DSP-MLIR](https://arxiv.org/abs/2408.11205) `dsp` dialect for
 audio processing. Upstream `dsp` is a large library of block/vector DSP ops (FFT/DFT,
@@ -103,89 +103,6 @@ still does **not**:
   history line, `dsp.lmsFilterResponse` keeps its adaptive weights, and the noise
   generators keep their LCG/colored-filter state. This is what makes the LMS canceller
   (`lms-noise.mlir`) seamless across calls.
-- **Addressed (lms-noise) -- oscillator/tone phase continuity.** The tone now resumes from a
-  persistent `@sample_offset` counter: the kernel reads it, starts the time base at
-  `offset*dt`, and stores `offset+N` back each call -- "implicit" global state, no host
-  involvement. This required generalizing `dsp.getRangeOfVector` to accept a *dynamic*
-  `first`/`step`: it previously hard-required `dsp.constant` operands (and null-deref-crashed
-  on anything else), and now constant-folds when it can, else loads the scalar at runtime and
-  feeds it to the same iter_arg recurrence. The constant path is unchanged (osc-low-pass
-  checksum bit-identical). Still open: `osc-low-pass.mlir`'s sawtooth uses the same
-  `getRangeOfVector(0, N, dt)` idiom and hasn't been converted, so a streamed sawtooth there
-  would still click.
-- **Addressed (lms-noise) -- small block size + block-synchronous host.** The kernel block is
-  now N=128 samples per `@run` call (was 512, originally 44100 = one second); only the
-  tensor/memref shapes and the `%n`/`%cnt` count constants change. 128 samples ≈ 2.9 ms ≈ a
-  344 Hz block rate, small enough that once-per-block ("control-rate") parameter automation
-  stays smooth. The CoreAudio host (`lms-noise-macOS.cpp`) was reworked to match: the old
-  double-buffer + 100 ms `regenerate` + wraparound loop is replaced by a background render
-  thread that produces 128-sample blocks into a lock-free SPSC ring buffer, drained by the
-  audio callback. No host-side loop remains -- `--stream` state and `@sample_offset` make each
-  block the true next 128 samples. The host also pins the hardware buffer
-  (`kAudioDevicePropertyBufferFrameSize` + `kAudioUnitProperty_MaximumFramesPerSlice`); the
-  ring makes playback correct even if the OS renegotiates a different slice size.
-- **Addressed (lms-noise) -- automated control-rate parameter on the signal path.** A one-pole
-  low-pass (`dsp.lowPassFilter`, a stateful op with a `memref<1xf64>` `state` global holding
-  `y[n-1]`) whose cutoff coefficient `alpha` is *automated* in-kernel: a pure-arith triangle LFO
-  over `@sample_offset` (period 147000 samples ≈ 3.3 s) sweeps alpha in [0.02, 0.35]. alpha is
-  read once per block (control-rate), matching the "read params before loops, not inside them"
-  rule; the LFO is deterministic in the sample counter, so it is walltime-insensitive like the
-  rest of the kernel. The filter sits on the **tone (signal) path**, not the final mix: the tone
-  was changed from a 440 Hz *sine* to a 440 Hz *sawtooth* (`2*frac(440*t) - 1`, via `dsp.modulo`
-  by 1), because a swept cutoff on a pure sine only tremolos its amplitude, whereas on a
-  harmonically-rich sawtooth it carves partials -- the classic, clearly audible filter sweep.
-  The tone is uncorrelated with the noise reference `x`, so it survives the adaptive canceller;
-  what you hear after cancellation is the swept-filtered sawtooth. (Probed tone-only: block RMS
-  rises ~0.14 at the LFO edges (muffled, cutoff ≈140 Hz) to ~0.57 at center (bright), tracking
-  the sweep; output bounded, no NaN/inf.) The sawtooth is naive (aliasing) -- fine for a demo.
-  The LFO *rate* is now itself interactive: the period lives in a `@lfo_period : memref<i64>`
-  global (default 147000) that the kernel loads once per `@run`, and the host's `+`/`-` keys
-  scale it (×1.25 per press, clamped to 4410..882000 samples ≈ 10 Hz..0.05 Hz), displayed in Hz.
-  So this is both an *automated* parameter (the in-kernel triangle) and a *manually* automated
-  one (the host adjusts the automation speed) -- two layers of control-rate parameter change.
-  (Verified: at 4× the rate the RMS-vs-normalized-phase envelope is identical but compressed to
-  ¼ the samples.)
-- **Addressed (lms-noise) -- zero heap per call (RT-safe kernel).** `insertAllocAndDealloc`
-  now stack-promotes any statically-shaped buffer ≤ 64 KiB to `memref.alloca` (hoisted to the
-  function entry block, no dealloc) instead of `memref.alloc`+`memref.dealloc`. At N=128 every
-  buffer (≤ 1 KiB for a 128×f64) qualifies, so the emitted `.ll` has **0 malloc / 0 free**
-  (was ~16 pairs per call). The last holdout was the `scf.index_switch` (noise-color selector)
-  result: its post-conversion fix-up in `ToyToAffineLoweringPass` used to unconditionally emit
-  one `memref.dealloc` on the switch result at the end of the block. Now that the case regions
-  yield stack allocas, that dealloc is both a stray `free` and undefined (freeing a stack
-  pointer); the fix-up only emits it for results every region yields via a heap `memref.alloc`.
-  The kernel is now safe to call from the audio callback, though the host still uses the ring
-  for slice-size decoupling.
-- **Addressed (lms-noise) -- compile-time malloc-free guarantee (on by default).** Zero heap
-  *for this kernel at N=128* is not by itself a guarantee: buffers over the 64 KiB stack-
-  promotion threshold, the handful of op lowerings that create `memref.alloc` directly
-  (bypassing `insertAllocAndDealloc`), dynamically-shaped buffers, and heap results escaping an
-  `scf.index_switch` would all still malloc. A verification pass (`AssertNoHeapAllocPass`,
-  module-level) runs **by default** for any runnable target (`--emit=llvm` and beyond), after
-  affine lowering but before memref->LLVM, and fails the compile (exit 4) if *any* `memref.alloc`
-  survives -- checking the actual emitted IR rather than reasoning about sizes, so it catches
-  every source. The error points at the offending op's source location. So a future edit that
-  reintroduces a heap buffer (e.g. bumping N past 8192, or adding a non-promoted op) breaks the
-  build instead of silently regressing real-time safety.
-  `--allow-heap` lifts the requirement: it downgrades the hard error to a warning (same message,
-  ` (allowed by --allow-heap)` suffix) so the kernel still builds, just no longer guaranteed
-  RT-safe -- useful for offline/large kernels (e.g. `osc-low-pass.mlir`'s 44200-sample buffers).
-  NB: toyc registers no MLIR diagnostic handler, so the default engine drops warnings and prints
-  only errors; the pass therefore prints the `--allow-heap` warning to stderr itself, in the
-  same `<loc>: warning: ...` shape. (Sanity-checked: lms-noise N=128 passes by default;
-  osc-low-pass fails by default and builds-with-5-warnings under `--allow-heap`.)
-- **Addressed (lms-noise) -- LMS input-history continuity (item 3).** `dsp.lmsFilterResponse`
-  now carries a *second* per-instance stream-state global (`state_hist`, alongside the weights
-  `state`): a `memref<(taps-1)xf64>` holding the previous block's last `taps-1` input samples.
-  `StreamStateMaterializationPass` materializes it and the op's lowering wires it in: the two
-  FIR loops gained an `else` branch on their `n - i >= 0` guard that, when `n - i < 0`, reads
-  `history[(taps-1) + n - i]` instead of zero-padding, and a small tail loop after the sample
-  loop saves `x[N-(taps-1) .. N-1]` back into the history for the next call. So the FIR sum
-  reaches into the real prior block at boundaries -- the per-block edge transient (the ~86 Hz
-  buzz at N=512) is gone, and even the old once-per-second glitch at N=44100 disappears. Zero-
-  initialized, so the very first block still zero-pads (nothing precedes the stream); the
-  non-streaming path is unchanged (no `state_hist` -> old behavior). This is exactly the
-  overlap-save history the stateless FIR below still lacks.
 - **Unaddressed -- FIR overlap-save history.** `dsp.FIRFilterResponse` is *not* a stateful
   op: it has no per-block history global and emits the full `len + N - 1` linear
   convolution. Streaming it block-by-block would corrupt the leading N-1 samples of each
@@ -233,114 +150,120 @@ the option exists before committing to always-sequential scan lowering.
 
 ## Performance Improvements
 
-The `_run` object generated today (Toy-tutorial lowering) is one heap buffer + one full
-loop per DSP op, every scalar constant heap-allocated, ~25 malloc/free per call, a scalar
-bounds-checked convolution, and no fusion. It looks alarming but most of the bloat is
-one-time setup/teardown that is NOT on the hot path.
+The reference kernel for this section is `lms-noise.mlir` (the streaming adaptive
+noise-canceller), built with `--stream`: `_mlir_ciface_run(%out: memref<128xf64>)` is called
+once per 128-sample block and resumes from module-scope state globals. Its per-block op chain
+is:
+* a colored-noise generator: one of four, behind `dsp.index_switch`
+* a sawtooth tone through a swept one-pole low-pass
+* two `dsp.delay` lines
+* 32-tap `dsp.lmsFilterResponse` adaptive filter subtracts the correlated noise (hot path)
 
-Flop budget for one `regenerate()` (44100-sample signal, 101-tap FIR):
-- ~9 elementwise loops (t, phase, ones, frac, saw2, saw, wc, coef, ...): ~9 x 44100 ~= 0.4M
-- coefficient build (sinc + hamming, with sin/cos): 101 taps, negligible
-- FIR convolution (44200 x up to 101): ~4.5M mul-add  <- ~90% of runtime
-- ~25 malloc + ~25 free: one-time, a few microseconds (<0.1% vs a few ms of compute)
+Flop budget for one block (128 samples ~= 2.9 ms of audio at 44.1 kHz):
+- LMS filter output `y[n] = sum_k w[k]*x[n-k]`: 128 x 32 ~= 4.1K mul-add
+- LMS weight update `w[k] += mu*e[n]*x[n-k]`: 128 x 32 ~= 4.1K mul-add  <- these two are the
+  hot path (the outer sample loop is a sequential adaptive recurrence; the 32-tap inner loop
+  is parallel)
+- active noise-color scan (only the selected `index_switch` case runs): 128 x ~6 ~= 0.8K
+- sawtooth + one-pole sweep + two delays + wet/dry mix (~8 elementwise 128-passes): ~1.5K
+- 0 malloc / 0 free
 
-So the convolution dominates and its inner loop is already the same arithmetic C would emit.
-The naive version is within ~2-4x of hand C, not 20x. There are two independent axes of
-improvement; do not conflate them. Axis A is backend codegen quality (matching C). Axis B is
-the domain-specific algebraic rewrites the DSP-MLIR paper measures.
+So ~10K flops/block, i.e. ~3.4 Mflop/s to keep up with real time. lms-noise is not throughput-bound; the meaningful metric is per-block worst-case latency (real-time headroom), not wall-clock over a long signal.
+
+The two per-tap `affine.if (n - k >= 0)` guards in the LMS loops (the `0 to 32` tap loops in
+the `--emit=mlir-affine` dump) are lms-noise's analog of the FIR zero-pad bounds check: they
+select the current-block sample `x[n-k]` vs the 31-sample carried history line, firing on
+every tap iteration. Splitting the sample loop at n=32 removes them from the steady state (A2),
+which in turn unblocks vectorizing the 32-tap inner loop (A1).
+
+There are two independent axes of improvement; do not conflate them. Axis A is backend codegen
+quality (matching what C would emit). Axis B is the domain-specific algebraic rewrites the
+DSP-MLIR paper measures.
 
 ### Measuring
 
-`bench.sh` builds the kernel object (from `osc-low-pass.mlir`) and a standalone driver
-(`bench.cpp`) that links the same `_mlir_ciface_run` as the CoreAudio host but strips the
-audio machinery, so it times ONLY the generated kernel. It is decoupled from how the object
-is built: change a pass/pipeline, rerun `./bench.sh`, diff the output. Usage:
+`bench.sh` + `bench.cpp` time the generated kernel in isolation: the driver links the same
+`_mlir_ciface_run` as the CoreAudio host but strips the audio machinery. It is decoupled from
+how the object is built: change a pass/pipeline, rerun `./bench.sh`, diff the output. Usage:
 `./bench.sh [--iterations N] [--warmup N]`.
 
 Each run prints a human summary plus one machine-readable line an agent can parse:
 `BENCH_JSON {"min_ms":..,"median_ms":..,"stddev_ms":..,"msample_per_s_median":..,"checksum":..}`.
 - Compare `min_ms` (most stable) or `median_ms`; lower is better.
-- `checksum` is the raw kernel output at cutoff=1000Hz. Axis A (pure codegen) must keep it
-  ~bit-stable; Axis B (numeric rewrites like FFT convolution) should keep it within fp
-  tolerance. A changed checksum on an Axis-A change means the optimization broke correctness.
+- `checksum` guards correctness. Axis A (pure codegen) must keep it ~bit-stable; Axis B
+  (numeric rewrites) should keep it within fp tolerance. A changed checksum on an Axis-A change
+  means the optimization broke correctness.
 
-`bench.sh` builds with `--opt` by default; pass `OPT=0 ./bench.sh` to build the plain
-baseline for an A/B. Baselines on this machine (checksum 1.769572322574197e+01, identical
-both ways):
-- plain pipeline (`OPT=0`): min ~3.86 ms, median ~4.05 ms/call, ~11 Msample/s.
-- `--opt` (default): min ~3.44 ms, median ~3.59 ms/call, ~12 Msample/s (~12% faster). This
-  is the number to beat.
+Open harness task: `bench.sh` today still builds the one-shot `osc-low-pass.mlir` throughput
+kernel (a 44100-sample FIR regenerate, where the older `min ~3.44 ms/call @ --opt` baselines
+came from). Now that `lms-noise.mlir` is the reference, port the driver to loop
+`_mlir_ciface_run` over 128-sample blocks under `--stream` and checksum the accumulated output
+-- and report **per-block** time / real-time headroom, since the LMS kernel's cost is per
+block, not a single regenerate() wall-time.
 
-What `--opt` already bought (vs plain): affine.for loops 13->9, memref.alloc 24->13,
-44100-elt intermediate buffers 7->4, 0-D scalar memrefs 49->21. It did NOT vectorize (zero
-NEON fp ops), did NOT hoist the convolution bounds check (the `affine.if` zero-pad guard is
-still in the tap loop), and left 16 malloc/free in the emitted IR. So the hot-path wins
-(A1/A2) and all of Axis B remain open. See the per-task status below.
+What `--opt` bought on lms-noise (vs plain): `affine.for` 28->19 (some pointwise chains fused),
+`memref.alloca` 46->32 (fewer live stack buffers). Both pipelines are already **0 malloc / 0
+free**. `--opt` did NOT vectorize (zero NEON fp ops) and did NOT split the LMS history-boundary
+`affine.if` out of the tap loop. So the heap work (A3/A5) is done; the hot-path wins (A1/A2)
+remain open. See the per-task status below.
 
 ### Axis A -- backend codegen quality
 
-- [ ] A1. Vectorize the FIR convolution (NEON). The inner loop at the convolution site is
-  scalar (fmul/fadd per tap); SIMD is the single biggest win (~2-4x) and the only change
-  that buys real speed here. Enable MLIR vectorization (e.g. affine/vector lowering, or
-  `-affine-super-vectorize`) so the tap loop emits vector fmla. Verify NEON (`fmla v*.2d`)
-  appears in the disassembly of the convolution loop.
-- [ ] A2. Hoist bounds checks out of the convolution inner loop. The zero-padding
-  `tbnz ...,#0x3f` tests fire every iteration (~4.5M times). Split the output range into
-  head (partial overlap), steady-state (full 101-tap, no checks), and tail regions -- what a
-  C programmer does by hand. This unblocks A1 (a clean steady-state loop vectorizes; a
-  branchy one does not).
-- [~] A3. Stop heap-allocating scalar constants. Each `tensor<f64>` constant (pi, fs, N, 2.0,
-  1.0, freq=440, dt, cutoff-load, ...) lowers to a malloc(8) + store + free. Lower 0-D
-  constants to SSA values (arith.constant / plain f64) instead of a memref. Deletes roughly
-  half the `bl malloc`/`bl free` pairs and all the associated stores. Cleanup + a little
-  speed, low risk.
-  PARTIAL (--opt): affine scalar replacement + the sawtooth rewrite cut 0-D scalar memrefs
-  49->21, but the emitted IR still has 16 malloc/free. Not fully lowered to SSA yet.
-- [~] A4. Fuse the elementwise loops. The sawtooth is 9 separate passes over 9 separate
-  44100-element buffers. Affine loop fusion (`-affine-loop-fusion`) collapses the pointwise
-  chain (t -> phase -> frac -> saw2 -> saw) into one pass over one buffer, cutting memory
-  traffic ~9x and removing the intermediate allocations. Confirm the intermediate buffers
-  disappear from the object.
-  PARTIAL (--opt): fusion is now enabled and collapsed part of the chain (loops 13->9,
-  44100-elt buffers 7->4). Not a single pass yet -- 4 elementwise loops remain; the chain
-  is not fully fused into one.
-- [~] A5. Buffer hoisting / reuse / stack promotion. Add buffer-deallocation +
-  buffer-loop-hoisting; promote small fixed-size buffers (the 101-tap arrays) to stack
-  (memref.alloca) so they never hit malloc. Pairs with A3/A4 to eliminate the remaining
-  one-time allocation overhead.
-  PARTIAL (--opt): total memref.alloc 24->13, but only as a side effect of A4 removing
-  intermediates. No stack promotion happened (memref.alloca count = 0); mallocs remain.
+- [ ] A1. Vectorize the LMS 32-tap loops (NEON). Both the filter dot-product and the weight
+  update are scalar (fmul/fadd per tap). The inner `0 to 32` loop over the tap weights is the
+  vectorization target (the outer sample loop carries the adaptive recurrence and stays
+  sequential). Needs A2 first: the per-tap `affine.if` history guard must be gone for a clean
+  vectorizable body. Verify NEON (`fmla v*.2d`) appears in the tap-loop disassembly.
+- [ ] A2. Hoist the history-boundary branch out of the tap loop. The `affine.if (n-k>=0)`
+  selects current-block vs carried-history sample on every one of the 128 x 32 x 2 tap
+  iterations. Split the sample loop into a head (n < 32, needs the history line) and a
+  steady state (n >= 32, pure current-block, no branch) -- what a C programmer writes by hand.
+  This unblocks A1 (a clean steady-state loop vectorizes; a branchy one does not).
+- [x] A3. Stop heap-allocating buffers/scalars. DONE: all statically-shaped buffers ≤64 KiB
+  stack-promote to `memref.alloca`; the emitted IR has 0 malloc/free in both pipelines, and
+  `AssertNoHeapAllocPass` (default-on) enforces it at compile time. `--opt` additionally
+  lowers most 0-D scalar constants to SSA (`arith.constant`).
+- [~] A4. Fuse the elementwise loops. Affine loop fusion collapsed part of the pointwise chain
+  (`affine.for` 28 -> 19 plain->opt; stack buffers 46 -> 32). Not a single pass yet -- several
+  128-element elementwise loops (t, sawtooth, tone, delay taps, mix) remain unfused. Confirm
+  intermediate buffers disappear from the affine dump.
+- [x] A5. Buffer stack promotion. DONE together with A3: no buffer hits malloc; the small
+  fixed-size arrays (128-sample block buffers, 32-tap weights, 31-sample history) are all
+  `memref.alloca`. Further buffer *reuse*/hoisting to shrink the 32 live allocas is optional
+  polish, not correctness.
 
 Status legend: [ ] = open, [~] = partially addressed by `--opt`, [x] = done.
-A1 and A2 are untouched by `--opt` and are the real hot-path wins.
+A3/A5 are done (malloc-free, compile-time-guaranteed). A1 and A2 are the remaining hot-path
+wins; A2 unblocks A1.
 
-Order to attempt: A3 + A4 first (clean up the IR and remove allocations, low risk) -- now
-partly done by `--opt`, finish them off, then A2 (makes the hot loop branch-free), then A1
-(vectorize the now-clean loop -- the real win), then A5 (mop up remaining allocations).
-Measure regenerate() wall-time before/after each.
+Order to attempt: A2 first (makes the LMS tap loop branch-free), then A1 (vectorize the now-
+clean loop -- the real win), then finish A4 (fuse the remaining elementwise chain). Measure
+per-block time before/after each.
 
 ### Axis B -- domain-specific optimizations
 
 These are legal only because the compiler understands DSP semantics; a generic C compiler
 (and often a C programmer) will not do them automatically. They are the DSP-MLIR value
-proposition and stack on top of good codegen.
+proposition and stack on top of good codegen. (Several were originally framed around the FIR
+low-pass demo `osc-low-pass.mlir`; noted below where they do or do not carry over to the LMS
+reference kernel, which has no large linear FIR.)
 
-- [ ] B1. Time-domain FIR -> FFT convolution. Rewrite the 44100 x 101 convolution as
-  O(N log N) via FFT (multiply spectra, inverse FFT). This is the classic order-of-magnitude
-  DSP win and a pure high-level dialect rewrite -- the single most illustrative change to
-  demonstrate the paper's optimizations, since the whole 44200 x 101 nested loop disappears.
-- [ ] B2. Coefficient hoisting (loop-invariant DSP). The windowed-sinc taps only change when
-  `cutoff` changes; recomputing sinc + hamming (with sin/cos) on every regenerate() is waste.
-  A DSP-aware invariant-hoisting pass lifts coefficient computation out of the per-batch path
-  and recomputes only when cutoff moves.
-- [ ] B3. Exploit input periodicity (linear -> circular convolution). The 440 Hz tone is
-  exactly periodic over 44100 samples, so the filtered output is periodic; folding the FIR
-  tail onto the head (out[n] += out[44100+n]) reconstructs circular convolution. The C++ host
-  already does this by hand -- a DSP dialect that recognizes a periodic input could emit it
-  automatically and drop the 100-sample tail work.
-- [ ] B4. Filter/stage fusion and algebraic identities. Cascade/fuse consecutive filters,
-  fold constant gains, simplify gain/delay compositions at the dialect level before lowering.
-  Minor here (single filter stage) but the general mechanism behind the paper's speedups.
+- [ ] B1. Block/parallelize the adaptive-filter recurrence. The LMS update is a feedback scan
+  (`w[n]=w[n-1]+mu*e[n]*x[n-i]`), sequential in n today. The escape hatch from the state-model
+  section applies: a linear recurrence can be reassociated / cast to a state-space transition
+  form (`state_block = f(state, x_block)`) to expose parallelism instead of a naive per-sample
+  scan. (This replaces the osc-only "FIR -> FFT convolution" item; lms-noise has no large FIR
+  to FFT.)
+- [ ] B2. Hoist loop-invariant DSP work. Coefficients/state that only change when a knob moves
+  can be lifted and refreshed only on change -- e.g. the one-pole sweep alpha is recomputed per
+  block from the LFO phase, but between blocks where `@lfo_period` is unchanged the per-sample
+  work is invariant. A DSP-aware invariant-hoisting pass is the general mechanism from the
+  paper. (For the FIR demo the same idea hoisted the windowed-sinc tap recompute past a static
+  `cutoff`.)
+- [ ] B3. Filter/stage fusion and algebraic identities. Cascade/fuse consecutive filters, fold
+  constant gains, simplify gain/delay compositions at the dialect level before lowering (e.g.
+  the tone's one-pole low-pass and the wet/dry mix). Minor here but the general mechanism
+  behind the paper's speedups.
 
 ## Runtime switching (`dsp.index_switch`) vs. compile-time specialization (`dsp.variant_switch`)
 
@@ -438,9 +361,3 @@ Semantics:
   independently is a cross product of clones; decide whether to nest dispatchers
   (product blow-up) or restrict to one switch per kernel initially and diagnose
   the rest. Document the chosen policy when implemented.
-
-DSP session:
-claude --resume 48701461-7c6a-4dd0-a967-120d220de8e7
-
-WASM session:
-claude --resume 9a199408-3c7a-4e8e-ae36-733eb5ad685c
