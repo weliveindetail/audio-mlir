@@ -1,50 +1,96 @@
-// Adaptive noise canceller (Widrow ANC) expressed ENTIRELY in the dsp dialect
-// -- no hand-written affine, everything is tensor-valued and lowers through the
-// standard bufferization. This is the tensor-based counterpart of the earlier
-// spelled-out affine kernel.
+// Adaptive noise canceller (Widrow ANC) with a RUNTIME-selectable noise color
+// driven by the @noise_kind knob via the dsp.index_switch op. dsp.index_switch
+// is a first-class dsp op: a runtime index selector picks one of several regions
+// and only the selected case runs.
 //
-//   x[n]  = white noise            (dsp.noise_white, an LCG stream)
+//   x[n]  = noise color chosen at run time (white/pink/brown/ou, or none=silence)
 //   n0[n] = 0.7 x[n] + 0.5 x[n-1] + 0.3 x[n-2]   (an "acoustic path", via delay)
 //   d[n]  = sin(2*pi*440*t) + n0[n]              (tone buried in noise)
 //   y     = LMS(x -> d), a 32-tap adaptive FIR   (dsp.lmsFilterResponse)
-//   out   = d - y                                (noise removed, tone revealed)
+//   out   = d - wet*y                            (noise removed, tone revealed)
 //
-// Cross-call persistence (block streaming) -- compile with --stream:
-// the StreamStateMaterialization pass gives each stateful op its own auto,
-// uniquely-named module-scope state global, so successive _mlir_ciface_run
-// calls continue ONE uninterrupted stream instead of restarting each block:
-//   * dsp.noise_white     -> memref<6xf64>  LCG + colored-filter state
-//   * dsp.delay (x2)      -> memref<Kxf64>  the delay line (last K inputs)
-//   * dsp.lmsFilterResponse -> memref<32xf64> the adaptive weights (converge)
-// None of this state is threaded through the @run signature.
+// dsp.index_switch mirrors scf.index_switch's syntax -- an index selector,
+// integer `case` regions, a mandatory `default`, regions yielding a common
+// result type (dsp.yield terminator). It is a distinct dsp op (not scf.index_-
+// switch directly) so it travels through the tensor-land frontend and only
+// bufferizes during affine lowering, where its own ConversionPattern rewrites it
+// to a memref-yielding scf.index_switch (one function, a runtime branch). This
+// is the intended, final lowering of dsp.index_switch.
 //
-// Interactive knobs:
-//   * @mu  (LMS learning rate) -- the LMS lowering loads it once, outside the
-//     per-sample loop, so it stays runtime-tunable AND loop-fusion-safe.
-//   * @wet (noise-cancellation depth) -- the terminal mix does out = d - wet*y
-//     via dsp.gain
-// Runtime noise-color select is NOT wired: the dsp.noise_* ops fix their color at
-// compile time (by op identity), so the color is white here. Making it runtime
-// would need a new noise op that selects the coloring from a scalar.
+// State model:
+//   * ops INSIDE the switch regions (the noise generators) get INDEPENDENT
+//     stream-state globals -- one per case, materialized by the stream-state
+//     pass, which walks into the switch regions before lowering.
+//   * ops OUTSIDE the switch (delay x2, LMS, tone phase) share ONE state global
+//     each across all variants.
+//   * the optional `reset = "region_local"` attribute is parsed but IGNORED by
+//     this runtime-branch lowering; it is reserved for the planned, separate
+//     dsp.variant_switch specialization/unswitch op (see samples/notes.md),
+//     which would clone the enclosing @run per case, build a dispatcher, and
+//     restart the noise state only on a switch.
+//
+// Cross-call persistence (block streaming) -- compile with --stream -- is
+// unchanged from lms-noise.mlir; the @run signature is identical, so the
+// existing interactive host drives this kernel as-is (Up/Down = @wet, and now
+// Left/Right = @noise_kind).
 module {
   // LMS adaptation rate (interactive, read at render time inside the kernel).
   memref.global "public" @mu : memref<f64> = dense<1.000000e-03>
   // Wet mix (interactive): fraction of the estimated noise to subtract.
-  // 0.0 = noise left in, 1.0 = full cancellation.
   memref.global "public" @wet : memref<f64> = dense<1.000000e+00>
+  // Noise color select (interactive): 0=white 1=pink 2=brown 3=ou, and any
+  // other value ("none") = silence. Read once per @run call as the
+  // dsp.index_switch selector; v1 assumes exactly this shape (a plain load of
+  // a named global), mid-term an arbitrary SSA selector.
+  memref.global "public" @noise_kind : memref<i64> = dense<0>
 
   dsp.func @run(%out: memref<44100xf64>) attributes {llvm.emit_c_interface} {
-    // --- white-noise reference x[n] (persistent LCG stream) ---
+    // --- shared noise parameters (defined outside the switch; the regions
+    //     reference them -- dsp.index_switch is NOT isolated-from-above) ---
     %seed  = dsp.constant dense<1.000000e+00> : tensor<f64>
     %sigma = dsp.constant dense<1.000000e+00> : tensor<f64>
     %n     = dsp.constant dense<4.410000e+04> : tensor<f64>
-    %x = "dsp.noise_white"(%n, %sigma, %seed) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<44100xf64>
+
+    // --- selector: load @noise_kind once, interpret as an index ---
+    %kmem  = memref.get_global @noise_kind : memref<i64>
+    %kval  = memref.load %kmem[] : memref<i64>
+    %ksel  = arith.index_cast %kval : i64 to index
+
+    // --- runtime noise-color reference x[n] ---
+    // Cases 0..3 each hold a stateful noise generator with its OWN persistent
+    // stream-state global; the default ("none") case is silence -- a stateless
+    // zero vector (getRangeOfVector with step 0), so it carries no state global.
+    // The reset="region_local" attribute (reserved for dsp.variant_switch) is
+    // ignored here: under the runtime-branch lowering the noise streams simply
+    // persist per case, so switching color resumes that case's stream.
+    %x = dsp.index_switch %ksel {reset = "region_local"} -> tensor<44100xf64>
+      case 0 {
+        %w = "dsp.noise_white"(%n, %sigma, %seed) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<44100xf64>
+        dsp.yield %w : tensor<44100xf64>
+      }
+      case 1 {
+        %p = "dsp.noise_pink"(%n, %sigma, %seed) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<44100xf64>
+        dsp.yield %p : tensor<44100xf64>
+      }
+      case 2 {
+        %b = "dsp.noise_brown"(%n, %sigma, %seed) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<44100xf64>
+        dsp.yield %b : tensor<44100xf64>
+      }
+      case 3 {
+        %o = "dsp.noise_ou"(%n, %sigma, %seed) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<44100xf64>
+        dsp.yield %o : tensor<44100xf64>
+      }
+      default {
+        // "none": silence. Different signature from the noise ops (no
+        // seed/sigma, no stream state) -- exactly why cases are regions, not an
+        // op-rename. Zeros = getRangeOfVector(first=0, N, step=0).
+        %z0 = dsp.constant dense<0.000000e+00> : tensor<f64>
+        %s  = "dsp.getRangeOfVector"(%z0, %n, %z0) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<44100xf64>
+        dsp.yield %s : tensor<44100xf64>
+      }
 
     // --- acoustic path n0[n] = 0.7 x[n] + 0.5 x[n-1] + 0.3 x[n-2] ---
-    // Delays carry their tail across calls (persistent), so the path is correct
-    // at block boundaries. Constant gains are broadcast as constant vectors
-    // (getRangeOfVector with step 0) and applied with vector*vector muls, which
-    // keeps every access 1-D and loop-fusion-friendly.
+    // (unchanged from lms-noise.mlir; operates on the selected %x)
     %zero = dsp.constant dense<0.000000e+00> : tensor<f64>
     %cnt  = dsp.constant dense<4.410000e+04> : tensor<f64>
     %d1c  = dsp.constant dense<1.000000e+00> : tensor<f64>

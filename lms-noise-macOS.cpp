@@ -9,19 +9,17 @@
 #include <termios.h>
 #include <AudioToolbox/AudioToolbox.h>
 
-// Interactive CoreAudio host for the LMS adaptive noise canceller
-// (lms-noise.mlir): a 440 Hz tone buried in broadband noise, with the noise
-// adaptively subtracted by a 32-tap LMS filter.
+// Interactive CoreAudio host for the runtime-color-selectable LMS adaptive
+// noise canceller (lms-noise.mlir), which uses dsp.index_switch on
+// the @noise_kind selector to pick the noise generator at run time.
 //
-//   Up / Down arrows  -> @wet:        how much of the estimated noise to remove
-//                                     (0 = noise back in, 1 = clean tone).
-//
-// The @noise_kind color-select knob is disabled: the dsp.noise_* ops fix their
-// color at compile time, so the kernel emits white noise only. The Left/Right
-// handling below is commented out until a runtime-color noise op exists.
+//   Up / Down arrows    -> @wet:        how much of the estimated noise to remove
+//                                       (0 = noise back in, 1 = clean tone).
+//   Left / Right arrows -> @noise_kind: cycle the noise color (white/pink/brown/
+//                                       ou/none), the live dsp.index_switch case.
 //
 // The noise reference is generated in-kernel from an LCG stream (the same math
-// the dsp.noise_white dialect op encodes); no RNG primitive or host-fed data is
+// the dsp.noise_* dialect ops encode); no RNG primitive or host-fed data is
 // needed.
 
 const double SAMPLE_RATE = 44100.0;
@@ -44,12 +42,17 @@ struct MemRefDescriptor1D {
 extern "C" void _mlir_ciface_run(MemRefDescriptor1D *out);
 extern "C" double mu;         // the DSL's @mu global (LMS step size, fixed here)
 extern "C" double wet;        // @wet: how much of the noise estimate to subtract
-// extern "C" double noise_kind; // @noise_kind: 0=white 1=pink 2=brown 3=ou
-//                               // disabled: kernel emits white noise only.
 
-// Number of selectable noise colors and their display names.
-// constexpr int NUM_KINDS = 4;
-// static const char *kKindNames[NUM_KINDS] = {"white", "pink", "brown", "ou"};
+// @noise_kind: the dsp.index_switch selector (0=white 1=pink 2=brown 3=ou,
+// any other value = silence). A discrete choice, so it is an integer global
+// (memref<i64> in the kernel) rather than a float knob like @mu / @wet.
+extern "C" int64_t noise_kind;
+
+// Selectable noise colors and their display names. Index 4 ("none") drives the
+// index_switch default (silence), so the knob sweeps every region.
+constexpr int NUM_KINDS = 5;
+static const char *kKindNames[NUM_KINDS] = {"white", "pink", "brown", "ou",
+                                            "none"};
 
 // Render one batch by invoking the kernel, which reads the current globals.
 static void fillBatch(double *buf, size_t n) {
@@ -102,10 +105,19 @@ void enableRawMode() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
-// Reprint the single status line (wet %).
+// Map the current @noise_kind to a display name. A value outside 0..3 selects
+// the index_switch default ("none"/silence).
+static const char *currentKindName() {
+    int k = static_cast<int>(noise_kind);
+    if (k < 0 || k >= NUM_KINDS - 1)
+        return kKindNames[NUM_KINDS - 1]; // "none"
+    return kKindNames[k];
+}
+
+// Reprint the single status line (wet % and current noise color).
 static void printStatus() {
-    printf("\rNoise reduction: %3.0f%%   |   Noise color: white   ",
-           wet * 100.0);
+    printf("\rNoise reduction: %3.0f%%   |   Noise color: %-12s ",
+           wet * 100.0, currentKindName());
     fflush(stdout);
 }
 
@@ -201,7 +213,7 @@ int main() {
     // and stay converged. Start fully wet (noise removed) with white noise.
     mu = 0.001;
     wet = 1.0;
-    // noise_kind = 0.0; // disabled: kernel emits white noise only
+    noise_kind = 0; // start on white
     regenerate();
 
     if (AudioOutputUnitStart(outputUnit) != noErr) {
@@ -219,6 +231,7 @@ int main() {
     std::cout << "    of it to remove and which color of noise to fight." << std::endl;
     std::cout << " -> [UP Arrow]    add cancellation (toward a clean tone)" << std::endl;
     std::cout << " -> [DOWN Arrow]  back it off (bring the interference back)" << std::endl;
+    std::cout << " -> [LEFT/RIGHT]  cycle noise color (white/pink/brown/ou/none)" << std::endl;
     std::cout << " -> [Q] or Ctrl+C to stop the program safely" << std::endl;
     std::cout << "==============================================\n" << std::endl;
 
@@ -239,15 +252,14 @@ int main() {
                         wet = std::max(0.0, wet - 0.05);
                         printStatus();
                     }
-                    // Left/Right noise-color select disabled (white-only kernel):
-                    // } else if (seq[1] == 'C') { // Right: next noise color
-                    //     int k = (static_cast<int>(noise_kind) + 1) % NUM_KINDS;
-                    //     noise_kind = static_cast<double>(k);
-                    //     printStatus();
-                    // } else if (seq[1] == 'D') { // Left: previous noise color
-                    //     int k = (static_cast<int>(noise_kind) + NUM_KINDS - 1) % NUM_KINDS;
-                    //     noise_kind = static_cast<double>(k);
-                    //     printStatus();
+                    // Left/Right cycle the @noise_kind index_switch selector.
+                    else if (seq[1] == 'C') { // Right: next color
+                        noise_kind = (noise_kind + 1) % NUM_KINDS;
+                        printStatus();
+                    } else if (seq[1] == 'D') { // Left: prev color
+                        noise_kind = (noise_kind + NUM_KINDS - 1) % NUM_KINDS;
+                        printStatus();
+                    }
                 }
             }
         }
