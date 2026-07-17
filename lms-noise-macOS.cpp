@@ -17,6 +17,8 @@
 //                                       (0 = noise back in, 1 = clean tone).
 //   Left / Right arrows -> @noise_kind: cycle the noise color (white/pink/brown/
 //                                       ou/none), the live dsp.index_switch case.
+//   + / - keys          -> @lfo_period: the cutoff-sweep automation speed
+//                                       (+ faster / - slower).
 //
 // The noise reference is generated in-kernel from an LCG stream (the same math
 // the dsp.noise_* dialect ops encode); no RNG primitive or host-fed data is
@@ -50,6 +52,17 @@ extern "C" double wet;        // @wet: how much of the noise estimate to subtrac
 // any other value = silence). A discrete choice, so it is an integer global
 // (memref<i64> in the kernel) rather than a float knob like @mu / @wet.
 extern "C" int64_t noise_kind;
+
+// @lfo_period: the cutoff-sweep LFO period in samples (the automation *speed*).
+// Smaller = faster sweep. The kernel computes the triangle phase as
+// @sample_offset mod @lfo_period, so this is read once per @run. Adjusted by the
+// +/- keys; kept strictly positive and within a musically sensible band.
+extern "C" int64_t lfo_period;
+
+// Automation-speed bounds (samples at 44100): ~10 Hz (fast) to ~0.05 Hz (~20 s).
+constexpr int64_t LFO_PERIOD_MIN = 4410;   // 44100 / 10  -> 10 Hz
+constexpr int64_t LFO_PERIOD_MAX = 882000; // 44100 * 20  -> 0.05 Hz
+constexpr double LFO_STEP = 1.25; // multiplicative step per key press
 
 // Selectable noise colors and their display names. Index 4 ("none") drives the
 // index_switch default (silence), so the knob sweeps every region.
@@ -130,10 +143,25 @@ static const char *currentKindName() {
     return kKindNames[k];
 }
 
-// Reprint the single status line (wet % and current noise color).
+// Current cutoff-sweep rate in Hz (LFO frequency = sample rate / period).
+static double lfoHz() {
+    return SAMPLE_RATE / static_cast<double>(lfo_period);
+}
+
+// Scale the automation speed by `factor` (>1 = faster sweep -> shorter period),
+// clamped to the sensible band. Rounds so the period stays a whole number.
+static void scaleLfoSpeed(double factor) {
+    double p = static_cast<double>(lfo_period) / factor; // faster => smaller period
+    int64_t np = static_cast<int64_t>(p + 0.5);
+    if (np < LFO_PERIOD_MIN) np = LFO_PERIOD_MIN;
+    if (np > LFO_PERIOD_MAX) np = LFO_PERIOD_MAX;
+    lfo_period = np;
+}
+
+// Reprint the single status line (wet %, noise color, and sweep speed).
 static void printStatus() {
-    printf("\rNoise reduction: %3.0f%%   |   Noise color: %-12s ",
-           wet * 100.0, currentKindName());
+    printf("\rNoise reduction: %3.0f%%   |   Noise color: %-6s |   Sweep: %5.2f Hz ",
+           wet * 100.0, currentKindName(), lfoHz());
     fflush(stdout);
 }
 
@@ -290,9 +318,9 @@ int main() {
     std::cout << " -> A 440 Hz tone corrupted by interference; the LMS filter" << std::endl;
     std::cout << "    estimates the interference and the knobs sweep how much" << std::endl;
     std::cout << "    of it to remove and which color of noise to fight." << std::endl;
-    std::cout << " -> [UP Arrow]    add cancellation (toward a clean tone)" << std::endl;
-    std::cout << " -> [DOWN Arrow]  back it off (bring the interference back)" << std::endl;
+    std::cout << " -> [UP/DOWN]     more / less cancellation (toward a clean tone)" << std::endl;
     std::cout << " -> [LEFT/RIGHT]  cycle noise color (white/pink/brown/ou/none)" << std::endl;
+    std::cout << " -> [+ / -]       cutoff-sweep speed (faster / slower)" << std::endl;
     std::cout << " -> [Q] or Ctrl+C to stop the program safely" << std::endl;
     std::cout << "==============================================\n" << std::endl;
 
@@ -301,6 +329,18 @@ int main() {
 
     char c;
     while (read(STDIN_FILENO, &c, 1) == 1 && c != 'q' && c != 'Q') {
+        // +/- (and =/_) change the cutoff-sweep automation speed. '+' speeds it
+        // up (shorter LFO period), '-' slows it down.
+        if (c == '+' || c == '=') {
+            scaleLfoSpeed(LFO_STEP);
+            printStatus();
+            continue;
+        }
+        if (c == '-' || c == '_') {
+            scaleLfoSpeed(1.0 / LFO_STEP);
+            printStatus();
+            continue;
+        }
         // Arrow keys send: '\x1b', '[', then 'A' Up / 'B' Down / 'C' Right / 'D' Left.
         if (c == '\x1b') {
             char seq[2];

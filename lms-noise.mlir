@@ -5,9 +5,17 @@
 //
 //   x[n]  = noise color chosen at run time (white/pink/brown/ou, or none=silence)
 //   n0[n] = 0.7 x[n] + 0.5 x[n-1] + 0.3 x[n-2]   (an "acoustic path", via delay)
-//   d[n]  = sin(2*pi*440*t) + n0[n]              (tone buried in noise)
+//   saw   = 2*frac(440*t) - 1                     (harmonically rich tone)
+//   tone  = lowPass(saw, alpha(t))               (swept 1st-order IIR, automated)
+//   d[n]  = tone[n] + n0[n]                       (tone buried in noise)
 //   y     = LMS(x -> d), a 32-tap adaptive FIR   (dsp.lmsFilterResponse)
-//   out   = d - wet*y                            (noise removed, tone revealed)
+//   out   = d - wet*y                            (noise removed, swept tone revealed)
+//
+// The low-pass sits on the *signal* path (the tone), not the final mix: a swept
+// cutoff on a pure sine only tremolos its amplitude, but on a sawtooth it carves
+// harmonics -- the classic, clearly audible filter sweep. The tone survives the
+// adaptive canceller (it is uncorrelated with the noise reference x), so what you
+// hear after cancellation is the swept-filtered sawtooth.
 //
 // dsp.index_switch mirrors scf.index_switch's syntax -- an index selector,
 // integer `case` regions, a mandatory `default`, regions yielding a common
@@ -31,8 +39,8 @@
 //
 // Cross-call persistence (block streaming) -- compile with --stream -- is
 // unchanged from lms-noise.mlir; the @run signature is identical, so the
-// existing interactive host drives this kernel as-is (Up/Down = @wet, and now
-// Left/Right = @noise_kind).
+// existing interactive host drives this kernel as-is (Up/Down = @wet,
+// Left/Right = @noise_kind, +/- = @lfo_period cutoff-sweep speed).
 module {
   // LMS adaptation rate (interactive, read at render time inside the kernel).
   memref.global "public" @mu : memref<f64> = dense<1.000000e-03>
@@ -50,6 +58,11 @@ module {
   // the sin argument stays accurate for many hours, so no wrap is needed (it could
   // be wrapped mod 44100, one exact tone period, for indefinite exactness).
   memref.global "public" @sample_offset : memref<i64> = dense<0>
+  // Low-pass cutoff-LFO period in samples (interactive): the automation speed.
+  // The triangle sweep below is `@sample_offset mod @lfo_period`, so a smaller
+  // period = faster sweep (LFO Hz = 44100 / period; default 147000 ≈ 0.3 Hz).
+  // The host writes this from the +/- keys; must stay > 0 (host clamps it).
+  memref.global "public" @lfo_period : memref<i64> = dense<147000>
 
   // BLOCK SIZE: N = 128 samples per @run call (~2.9 ms at 44100). Small on
   // purpose: parameters are read once per call (control-rate == block-rate), so
@@ -128,11 +141,13 @@ module {
     %n01 = "dsp.add"(%p0, %p1) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
     %n0  = "dsp.add"(%n01, %p2) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
 
-    // --- 440 Hz tone: sin(2*pi*440 * t), continuous across blocks ---
+    // --- 440 Hz sawtooth tone: 2*frac(440*t) - 1, continuous across blocks ---
     // Phase continuity: instead of restarting t at 0 each call, resume the time
     // base from the persistent @sample_offset counter, so t[n] = (offset+n)*dt.
     // Read offset, build t from offset*dt, then store offset+N back -- the host
-    // never touches it ("implicit" global state).
+    // never touches it ("implicit" global state). A sawtooth (harmonically rich),
+    // not a sine, so the swept low-pass below has partials to carve. Naive
+    // (aliasing) saw -- fine for a demo; frac(x) = x mod 1 via dsp.modulo by 1.
     %dt     = dsp.constant dense<2.2675736961451248E-5> : tensor<f64>  // 1/44100
     %offmem = memref.get_global @sample_offset : memref<i64>
     %offval = memref.load %offmem[] : memref<i64>
@@ -145,10 +160,45 @@ module {
     %blk    = arith.constant 128 : i64
     %offnew = arith.addi %offval, %blk : i64
     memref.store %offnew, %offmem[] : memref<i64>
-    %w440  = dsp.constant dense<2.764601535159018E+3> : tensor<f64>    // 2*pi*440
-    %w440v = "dsp.getRangeOfVector"(%w440, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    %arg   = "dsp.mul"(%t, %w440v) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    %tone  = dsp.sin(%arg : tensor<128xf64>) to tensor<128xf64>
+    %f440  = dsp.constant dense<4.400000e+02> : tensor<f64>            // 440 Hz
+    %f440v = "dsp.getRangeOfVector"(%f440, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
+    %cyc   = "dsp.mul"(%t, %f440v) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>  // cycles = 440*t
+    %one1  = dsp.constant dense<1.000000e+00> : tensor<f64>
+    %ones  = "dsp.getRangeOfVector"(%one1, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
+    %frac  = "dsp.modulo"(%cyc, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>  // frac(440*t) in [0,1)
+    %saw2  = "dsp.add"(%frac, %frac) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>     // 2*frac
+    %saw   = "dsp.sub"(%saw2, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>     // 2*frac - 1
+
+    // --- automated low-pass on the tone: cutoff swept by a slow in-kernel LFO ---
+    // alpha (the 1st-order IIR coefficient) is recomputed once per @run from a
+    // ~0.3 Hz triangle over @sample_offset -- an "automated parameter" driven
+    // entirely in-kernel, no host involvement. Read once and held for the block
+    // (block-rate automation); N=128 (~2.9 ms) keeps the sweep step-free.
+    // dsp.lowPassFilter carries --stream state (its previous output), so the
+    // filtered tone is continuous across calls (no per-block click). Applied to
+    // the sawtooth here (the signal path), so the sweep is audible as a timbral
+    // change, not just amplitude. Triangle is pure arith (|2f-1| via cmp/select).
+    %lpPmem = memref.get_global @lfo_period : memref<i64>  // interactive sweep speed
+    %lpP    = memref.load %lpPmem[] : memref<i64>         // LFO period (samples)
+    %lpPf   = arith.sitofp %lpP : i64 to f64
+    %lpph   = arith.remsi %offval, %lpP : i64             // phase 0..P-1
+    %lpphf  = arith.sitofp %lpph : i64 to f64
+    %lpfrac = arith.divf %lpphf, %lpPf : f64              // 0..1
+    %lp2    = arith.constant 2.000000e+00 : f64
+    %lp1    = arith.constant 1.000000e+00 : f64
+    %lp0    = arith.constant 0.000000e+00 : f64
+    %lp2f   = arith.mulf %lpfrac, %lp2 : f64
+    %lp2fm1 = arith.subf %lp2f, %lp1 : f64               // -1..1
+    %lpneg  = arith.negf %lp2fm1 : f64
+    %lpisn  = arith.cmpf olt, %lp2fm1, %lp0 : f64
+    %lpabs  = arith.select %lpisn, %lpneg, %lp2fm1 : f64 // |2f-1|
+    %lptri  = arith.subf %lp1, %lpabs : f64              // 0 at edges, 1 at center
+    %lpamin = arith.constant 2.000000e-02 : f64          // muffled floor (~140 Hz)
+    %lpaspn = arith.constant 3.300000e-01 : f64          // span -> up to ~0.35 (bright)
+    %lpamod = arith.mulf %lptri, %lpaspn : f64
+    %lpaf   = arith.addf %lpamod, %lpamin : f64          // alpha in [0.02, 0.35]
+    %lpalpha = tensor.from_elements %lpaf : tensor<f64>
+    %tone   = "dsp.lowPassFilter"(%saw, %lpalpha) : (tensor<128xf64>, tensor<f64>) -> tensor<128xf64>
 
     // --- desired d[n] = tone + colored noise ---
     %d = "dsp.add"(%tone, %n0) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>

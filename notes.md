@@ -124,14 +124,27 @@ still does **not**:
   block the true next 128 samples. The host also pins the hardware buffer
   (`kAudioDevicePropertyBufferFrameSize` + `kAudioUnitProperty_MaximumFramesPerSlice`); the
   ring makes playback correct even if the OS renegotiates a different slice size.
-- **Addressed (lms-noise) -- automated control-rate parameter.** The demo now ends with a
-  one-pole low-pass (`dsp.lowPassFilter`, a stateful op with a `memref<1xf64>` `state` global
-  holding `y[n-1]`) whose cutoff coefficient `alpha` is *automated* in-kernel: a pure-arith
-  triangle LFO over `@sample_offset` (period 147000 samples ≈ 3.3 s) sweeps alpha in
-  [0.02, 0.35]. alpha is read once per block (control-rate), matching the "read params before
-  loops, not inside them" rule; the LFO is deterministic in the sample counter, so it is
-  walltime-insensitive like the rest of the kernel. Demonstrates block-rate automation without
-  any host knob.
+- **Addressed (lms-noise) -- automated control-rate parameter on the signal path.** A one-pole
+  low-pass (`dsp.lowPassFilter`, a stateful op with a `memref<1xf64>` `state` global holding
+  `y[n-1]`) whose cutoff coefficient `alpha` is *automated* in-kernel: a pure-arith triangle LFO
+  over `@sample_offset` (period 147000 samples ≈ 3.3 s) sweeps alpha in [0.02, 0.35]. alpha is
+  read once per block (control-rate), matching the "read params before loops, not inside them"
+  rule; the LFO is deterministic in the sample counter, so it is walltime-insensitive like the
+  rest of the kernel. The filter sits on the **tone (signal) path**, not the final mix: the tone
+  was changed from a 440 Hz *sine* to a 440 Hz *sawtooth* (`2*frac(440*t) - 1`, via `dsp.modulo`
+  by 1), because a swept cutoff on a pure sine only tremolos its amplitude, whereas on a
+  harmonically-rich sawtooth it carves partials -- the classic, clearly audible filter sweep.
+  The tone is uncorrelated with the noise reference `x`, so it survives the adaptive canceller;
+  what you hear after cancellation is the swept-filtered sawtooth. (Probed tone-only: block RMS
+  rises ~0.14 at the LFO edges (muffled, cutoff ≈140 Hz) to ~0.57 at center (bright), tracking
+  the sweep; output bounded, no NaN/inf.) The sawtooth is naive (aliasing) -- fine for a demo.
+  The LFO *rate* is now itself interactive: the period lives in a `@lfo_period : memref<i64>`
+  global (default 147000) that the kernel loads once per `@run`, and the host's `+`/`-` keys
+  scale it (×1.25 per press, clamped to 4410..882000 samples ≈ 10 Hz..0.05 Hz), displayed in Hz.
+  So this is both an *automated* parameter (the in-kernel triangle) and a *manually* automated
+  one (the host adjusts the automation speed) -- two layers of control-rate parameter change.
+  (Verified: at 4× the rate the RMS-vs-normalized-phase envelope is identical but compressed to
+  ¼ the samples.)
 - **Addressed (lms-noise) -- zero heap per call (RT-safe kernel).** `insertAllocAndDealloc`
   now stack-promotes any statically-shaped buffer ≤ 64 KiB to `memref.alloca` (hoisted to the
   function entry block, no dealloc) instead of `memref.alloc`+`memref.dealloc`. At N=128 every
