@@ -29,7 +29,7 @@ const double SAMPLE_RATE = 44100.0;
 // There is no host-side loop any more: --stream state (noise/LMS/delay) and the
 // in-kernel @sample_offset (tone phase) carry continuity across calls, so each
 // block is the true next 512 samples of an endless stream.
-const size_t BLOCK_SAMPLES = 512;
+const size_t BLOCK_SAMPLES = 128;
 
 //===----------------------------------------------------------------------===//
 // DSP-MLIR kernel boundary
