@@ -103,11 +103,33 @@ still does **not**:
   history line, `dsp.lmsFilterResponse` keeps its adaptive weights, and the noise
   generators keep their LCG/colored-filter state. This is what makes the LMS canceller
   (`lms-noise.mlir`) seamless across calls.
-- **Unaddressed -- oscillator/tone phase continuity.** Both samples build the time base
-  with `getRangeOfVector(0, N, dt)`, i.e. every call restarts at `t = 0`. No phase is
-  carried as state, so a *streamed* sine/sawtooth clicks at each block boundary.
-  `osc-low-pass.mlir` flags this in a comment ("Consider switching to phase when moving on
-  to block-based processing"). The fix is a stateful phase (start-offset in, phase-out).
+- **Addressed (lms-noise) -- oscillator/tone phase continuity.** The tone now resumes from a
+  persistent `@sample_offset` counter: the kernel reads it, starts the time base at
+  `offset*dt`, and stores `offset+N` back each call -- "implicit" global state, no host
+  involvement. This required generalizing `dsp.getRangeOfVector` to accept a *dynamic*
+  `first`/`step`: it previously hard-required `dsp.constant` operands (and null-deref-crashed
+  on anything else), and now constant-folds when it can, else loads the scalar at runtime and
+  feeds it to the same iter_arg recurrence. The constant path is unchanged (osc-low-pass
+  checksum bit-identical). Still open: `osc-low-pass.mlir`'s sawtooth uses the same
+  `getRangeOfVector(0, N, dt)` idiom and hasn't been converted, so a streamed sawtooth there
+  would still click.
+- **Addressed (lms-noise) -- small block size + block-synchronous host.** The kernel block is
+  now N=512 samples per `@run` call (was 44100 = one second); only the tensor/memref shapes
+  and the `%n`/`%cnt` count constants change. The CoreAudio host (`lms-noise-macOS.cpp`) was
+  reworked to match: the old double-buffer + 100 ms `regenerate` + wraparound loop is replaced
+  by a background render thread that produces 512-sample blocks into a lock-free SPSC ring
+  buffer, drained by the audio callback (the kernel still does ~16 malloc/free per call, so it
+  is not RT-safe to invoke inside the callback). No host-side loop remains -- `--stream` state
+  and `@sample_offset` make each block the true next 512 samples. The host also pins the
+  hardware buffer to 512 frames (`kAudioDevicePropertyBufferFrameSize` +
+  `kAudioUnitProperty_MaximumFramesPerSlice`); the ring makes playback correct even if the OS
+  renegotiates a different slice size.
+- **Unaddressed -- LMS input-history continuity (item 3).** `dsp.lmsFilterResponse` persists
+  only its 32 adaptive weights across calls, not the last 31 input samples the FIR sum needs:
+  its `iv - iv2 >= 0` guard zero-pads at each block start, so the first ~31 outputs of every
+  block carry a small transient. Inaudible at N=44100 (one per second), but audible at N=512
+  (~86 per second). Fixing it needs a per-instance input-history global (the same overlap-save
+  state the FIR below wants), deferred to a separate step.
 - **Unaddressed -- FIR overlap-save history.** `dsp.FIRFilterResponse` is *not* a stateful
   op: it has no per-block history global and emits the full `len + N - 1` linear
   convolution. Streaming it block-by-block would corrupt the leading N-1 samples of each

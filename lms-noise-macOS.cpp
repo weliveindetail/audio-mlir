@@ -24,9 +24,12 @@
 
 const double SAMPLE_RATE = 44100.0;
 
-// The kernel writes exactly one second: memref<44100xf64>.
-const size_t BATCH_SAMPLES = 44100;
-const size_t LOOP_SAMPLES = 44100;
+// The kernel writes exactly one block per @run call: memref<512xf64>. This must
+// match the tensor/memref shape in lms-noise.mlir (N in its BLOCK SIZE note).
+// There is no host-side loop any more: --stream state (noise/LMS/delay) and the
+// in-kernel @sample_offset (tone phase) carry continuity across calls, so each
+// block is the true next 512 samples of an endless stream.
+const size_t BLOCK_SAMPLES = 512;
 
 //===----------------------------------------------------------------------===//
 // DSP-MLIR kernel boundary
@@ -54,39 +57,52 @@ constexpr int NUM_KINDS = 5;
 static const char *kKindNames[NUM_KINDS] = {"white", "pink", "brown", "ou",
                                             "none"};
 
-// Render one batch by invoking the kernel, which reads the current globals.
-static void fillBatch(double *buf, size_t n) {
-    MemRefDescriptor1D desc{buf, buf, 0, static_cast<int64_t>(n), 1};
+// Render one block by invoking the kernel, which reads the current globals and
+// advances its own --stream / @sample_offset state.
+static void fillBlock(double *buf) {
+    MemRefDescriptor1D desc{buf, buf, 0, static_cast<int64_t>(BLOCK_SAMPLES), 1};
     _mlir_ciface_run(&desc);
 }
 
-// Double-buffered batch: the audio thread streams from gActive while the render
-// thread rebuilds the next batch into the back buffer, then swaps.
-static double gBufferA[BATCH_SAMPLES];
-static double gBufferB[BATCH_SAMPLES];
-static std::atomic<double *> gActive{gBufferA};
-static double *gBackBuffer = gBufferB;
-static size_t gReadPos = 0; // only touched by the audio thread
 static std::atomic<bool> gRunning{true};
 
-// How often the render thread rebuilds the batch. Bounds how quickly a wet /
-// noise_kind change becomes audible.
-constexpr auto REGEN_PERIOD = std::chrono::milliseconds(100);
+//===----------------------------------------------------------------------===//
+// Lock-free SPSC ring buffer (render thread -> audio callback)
+//===----------------------------------------------------------------------===//
+// The kernel still does ~16 malloc/free per @run call, so it is NOT real-time
+// safe to invoke inside the CoreAudio callback. Instead a background render
+// thread produces 512-sample blocks into this ring and the callback only copies
+// out -- no allocation, no locks on the audio thread. The ring decouples the
+// producer's block granularity from the callback's frame count.
+//
+// Capacity is a power of two so index wrap is a mask. Single producer / single
+// consumer: the producer owns gHead, the consumer owns gTail; each publishes its
+// index with release and reads the other's with acquire.
+constexpr size_t RING_CAPACITY = 1u << 13; // 8192 samples (~16 blocks, ~186 ms)
+constexpr size_t RING_MASK = RING_CAPACITY - 1;
+static double gRing[RING_CAPACITY];
+static std::atomic<size_t> gHead{0}; // next write index (producer)
+static std::atomic<size_t> gTail{0}; // next read index  (consumer)
 
-// Rebuild the back buffer from the kernel and publish it. Only the render
-// thread calls this once audio is live, so it owns gBackBuffer.
-static void regenerate() {
-    double *back = gBackBuffer;
-    fillBatch(back, BATCH_SAMPLES);
-    gBackBuffer = gActive.exchange(back, std::memory_order_acq_rel);
-}
-
-// Background render thread: periodically regenerate so global changes written
-// from the keyboard thread are picked up asynchronously.
+// Background render thread: keep the ring as full as possible, one kernel block
+// at a time, so wet / noise_kind changes written from the keyboard thread are
+// picked up within a block or two. Renders into a scratch block then copies into
+// the ring (the kernel needs a contiguous 512-wide memref).
 static void renderLoop() {
+    double scratch[BLOCK_SAMPLES];
     while (gRunning.load(std::memory_order_relaxed)) {
-        regenerate();
-        std::this_thread::sleep_for(REGEN_PERIOD);
+        size_t head = gHead.load(std::memory_order_relaxed);
+        size_t tail = gTail.load(std::memory_order_acquire);
+        size_t used = head - tail;
+        if (used + BLOCK_SAMPLES > RING_CAPACITY) {
+            // Ring is full enough; wait for the callback to drain a bit.
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        fillBlock(scratch);
+        for (size_t i = 0; i < BLOCK_SAMPLES; ++i)
+            gRing[(head + i) & RING_MASK] = scratch[i];
+        gHead.store(head + BLOCK_SAMPLES, std::memory_order_release);
     }
 }
 
@@ -132,18 +148,21 @@ OSStatus AudioCallback(void *inRefCon,
     float *leftChannel = static_cast<float*>(ioData->mBuffers[0].mData);
     float *rightChannel = static_cast<float*>(ioData->mBuffers[1].mData);
 
-    const double *batch = gActive.load(std::memory_order_acquire);
-    size_t pos = gReadPos;
+    size_t tail = gTail.load(std::memory_order_relaxed);
+    size_t head = gHead.load(std::memory_order_acquire);
+    size_t avail = head - tail;
 
     for (UInt32 i = 0; i < inNumberFrames; ++i) {
-        float s = static_cast<float>(batch[pos]); // f64 -> f32 on copy
+        float s = 0.0f; // underrun -> silence rather than a stale/looped sample
+        if (i < avail) {
+            s = static_cast<float>(gRing[tail & RING_MASK]); // f64 -> f32 on copy
+            ++tail;
+        }
         leftChannel[i] = s;
         rightChannel[i] = s;
-        if (++pos >= LOOP_SAMPLES)
-            pos = 0;
     }
 
-    gReadPos = pos;
+    gTail.store(tail, std::memory_order_release);
     return noErr;
 }
 
@@ -204,17 +223,59 @@ int main() {
         return 1;
     }
 
+    // Pin the callback frame count to one kernel block (N=512). This is a hint:
+    // the ring buffer already decouples producer blocks from callback frames, so
+    // playback is correct even if CoreAudio renegotiates a different slice size.
+    // (a) MaximumFramesPerSlice bounds the frames the unit will ever ask for.
+    UInt32 maxFrames = BLOCK_SAMPLES;
+    AudioUnitSetProperty(outputUnit,
+                         kAudioUnitProperty_MaximumFramesPerSlice,
+                         kAudioUnitScope_Global,
+                         0,
+                         &maxFrames,
+                         sizeof(maxFrames));
+    // (b) Ask the default output *device* to use a 512-frame hardware buffer so
+    //     the callback is actually invoked once per block.
+    AudioDeviceID outputDevice = 0;
+    UInt32 devSize = sizeof(outputDevice);
+    AudioObjectPropertyAddress devAddr = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain};
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &devAddr, 0, nullptr,
+                                   &devSize, &outputDevice) == noErr) {
+        UInt32 frameSize = BLOCK_SAMPLES;
+        AudioObjectPropertyAddress bufAddr = {
+            kAudioDevicePropertyBufferFrameSize,
+            kAudioObjectPropertyScopeOutput,
+            kAudioObjectPropertyElementMain};
+        AudioObjectSetPropertyData(outputDevice, &bufAddr, 0, nullptr,
+                                   sizeof(frameSize), &frameSize);
+    }
+
     if (AudioUnitInitialize(outputUnit) != noErr) {
         std::cerr << "Could not initialize Core Audio hardware context buffers." << std::endl;
         return 1;
     }
 
-    // Fix mu small so the persistent weights converge over a few looped buffers
-    // and stay converged. Start fully wet (noise removed) with white noise.
+    // Fix mu small so the persistent LMS weights converge over the first few
+    // blocks and stay converged. Start fully wet (noise removed) with white
+    // noise. The kernel's --stream state (and @sample_offset) persist across the
+    // 512-sample @run calls, so there is no host-side loop.
     mu = 0.001;
     wet = 1.0;
     noise_kind = 0; // start on white
-    regenerate();
+
+    // Prime the ring with a few blocks so the very first callbacks never
+    // underrun before the render thread has spun up.
+    for (int i = 0; i < 4; ++i) {
+        double scratch[BLOCK_SAMPLES];
+        fillBlock(scratch);
+        size_t head = gHead.load(std::memory_order_relaxed);
+        for (size_t j = 0; j < BLOCK_SAMPLES; ++j)
+            gRing[(head + j) & RING_MASK] = scratch[j];
+        gHead.store(head + BLOCK_SAMPLES, std::memory_order_release);
+    }
 
     if (AudioOutputUnitStart(outputUnit) != noErr) {
         std::cerr << "Could not start audio stream output pipeline." << std::endl;
