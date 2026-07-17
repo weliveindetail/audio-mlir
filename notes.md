@@ -235,3 +235,100 @@ proposition and stack on top of good codegen.
 - [ ] B4. Filter/stage fusion and algebraic identities. Cascade/fuse consecutive filters,
   fold constant gains, simplify gain/delay compositions at the dialect level before lowering.
   Minor here (single filter stage) but the general mechanism behind the paper's speedups.
+
+## Runtime switching (`dsp.index_switch`) vs. compile-time specialization (`dsp.variant_switch`)
+
+Runtime noise-color selection is implemented today by **`dsp.index_switch`**, a
+first-class dsp op. It is syntactically a near-clone of `scf.index_switch` (an
+index selector, integer `case` regions, a mandatory `default`, a common result
+type, `dsp.yield` terminator) but is a distinct dsp op so it is born and stays in
+tensor land through the frontend and only bufferizes during affine lowering --
+exactly like every other dsp op in this (deliberately bufferization-pass-free)
+toolchain. Its `ConversionPattern` in `LowerToAffineLoops.cpp`
+(`IndexSwitchOpLowering` + `YieldOpLowering`) rewrites it to a memref-yielding
+`scf.index_switch`, which then lowers through `cf` to LLVM. This is the
+**intended, final** lowering of `dsp.index_switch`: one function, a runtime
+branch, only the selected case runs. There is no "fallback" framing -- this is
+the whole op.
+
+`dsp.index_switch` accepts an optional `reset` attribute but **ignores** it; the
+attribute is reserved for the sibling op below.
+
+### Planned: `dsp.variant_switch` (compile-time specialization / unswitch)
+
+`dsp.variant_switch` is a **separate, explicit** op offering the compile-time
+specialization ("unswitch") alternative to the runtime branch. It shares
+`dsp.index_switch`'s syntax (same selector / `case` / `default` / `dsp.yield`
+shape, same optional `reset`) but has fundamentally different lowering
+semantics and, crucially, **no fallback**: where it cannot be applied it raises a
+compile-time error rather than silently degrading to a runtime branch. (If a
+runtime branch is what you want, write `dsp.index_switch`.)
+
+Semantics:
+
+- **Unswitch the enclosing kernel.** Instead of emitting one function with a
+  runtime branch, the specialization pass clones the enclosing `@run` once per
+  case (plus the default), with that case's region inlined in place of the
+  switch, and constant-folds/specializes each clone. The selector then drives a
+  small **dispatcher** that calls the matching specialized clone. Each variant is
+  a straight-line kernel with no switch overhead, which is what makes the ops
+  inside it independently optimizable (per-case shape inference, fusion, etc.).
+- **State model (the reason `reset` exists).** Ops **inside** the switch regions
+  (the noise generators) get **independent** stream-state globals -- one per
+  case -- so each color keeps its own stream. Ops **outside** the switch (the two
+  delays, the LMS weights, the tone phase) share **one** state global each across
+  all variants. `reset = "region_local"` means: when the selector changes between
+  calls, cleanly restart **only** the noise (region-local) state, while the
+  shared LMS/delay/tone state persists across the switch -- "reset noises only".
+  This is a real behavioral difference from `dsp.index_switch`, where all streams
+  simply persist per case.
+- **Error where it can't apply (no fallback).** The pass must diagnose and reject
+  cases it cannot specialize, e.g.: the selector is not a compile-time-tractable
+  value it can build a dispatcher for; a region result type it cannot thread
+  through the cloned signature; or a state-sharing pattern that violates the
+  inside/outside partition. Each is a clear `emitError`, never a silent runtime
+  branch.
+
+### Implementation steps
+
+1. **ODS.** Add `def VariantSwitchOp : Dsp_Op<"variant_switch", ...>` mirroring
+   `IndexSwitchOp` (index `arg`, `DenseI64ArrayAttr` cases, optional `reset`,
+   variadic results, `SizedRegion<1>` default + `VariadicRegion` cases,
+   `dsp.yield` terminator, verifier). It can reuse the `parseIndexSwitchCases` /
+   `printIndexSwitchCases` custom directive. Extend `dsp.yield`'s `ParentOneOf`
+   to accept both `IndexSwitchOp` and `VariantSwitchOp`.
+2. **KernelSpecialization pass** (module-level, runs before
+   `StreamStateMaterialization` so per-clone noise ops each get their own state
+   global via the existing identity walk):
+   - Locate each `dsp.variant_switch` and its enclosing kernel function.
+   - For each case + default, clone the function, inline that region's body in
+     place of the switch (RAUW the switch result with the region's yielded
+     value), and drop the other regions.
+   - Materialize the independent per-variant noise state and the shared
+     outside-state, honoring `reset`: region-local state globals are reset on a
+     selector change; shared globals persist.
+   - Build a dispatcher (the original entry) that reads the selector and calls
+     the matching specialized clone; the default clone handles the fall-through.
+   - `emitError` and fail the pass on any non-specializable construct (see the
+     error list above) -- no fallback to `scf.index_switch`.
+3. **Pipeline wiring.** Add `createKernelSpecializationPass()` to `Passes.h` and
+   run it in `toyc.cpp` under `isLoweringToAffine`, before
+   `StreamStateMaterialization` and `LowerToAffine`. The specialized clones then
+   lower through the ordinary per-op affine patterns; there is no residual
+   `dsp.variant_switch` for `LowerToAffine` to see.
+4. **Tests.** A variant of `lms-noise.mlir` that swaps `dsp.index_switch` for
+   `dsp.variant_switch`, checking (a) N+1 specialized clones + a dispatcher in
+   the lowered IR, (b) independent noise state per clone, (c) reset-on-switch of
+   region-local state only, and (d) a clean diagnostic on a deliberately
+   non-specializable selector.
+
+### Next steps (beyond the initial version)
+
+- **Arbitrary SSA selectors.** v1 assumes the selector is a plain load of a named
+  global (`@noise_kind`). Generalize the dispatcher to build from an arbitrary
+  `index` SSA value, falling back to `emitError` only when it truly cannot form a
+  dispatch (rather than assuming the global shape).
+- **Multiple `dsp.variant_switch` in one kernel.** Specializing N switches
+  independently is a cross product of clones; decide whether to nest dispatchers
+  (product blow-up) or restrict to one switch per kernel initially and diagnose
+  the rest. Document the chosen policy when implemented.
