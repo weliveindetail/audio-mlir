@@ -39,17 +39,16 @@
   <h1>audio-mlir samples in WebAssembly</h1>
   <p class="sub">
     A DSP-MLIR kernel compiled to WASM (relocatable object → <code>wasm-ld</code>),
-    driven from JS over the same memref ABI as the native <code>sample-macOS.cpp</code>
-    host: a <code>MemRefDescriptor1D</code> in linear memory plus shared parameter globals.
+    driven from JS over the same ABI as the native driver
   </p>
 
   <section class="panel" id="lmsPanel">
     <h2>LMS Adaptive Noise Canceller</h2>
     <p class="desc">
-      A 440&nbsp;Hz tone buried in colored noise; a 32-tap LMS adaptive FIR learns the
-      noise path and subtracts it. <code>@noise_kind</code> picks the color,
+      A swept-low-pass 440&nbsp;Hz sawtooth buried in colored noise; a 32-tap LMS adaptive
+      FIR learns the noise path and subtracts it. <code>@noise_kind</code> picks the color,
       <code>@wet</code> sweeps how much of the estimate to remove (0 = noisy, 1 = tone revealed),
-      and <code>@mu</code> is the adaptation rate.
+      and <code>@lfo_period</code> sets the in-kernel cutoff-sweep speed.
     </p>
     <div class="row">
       <button id="lmsStart" class="primary">▶ Start audio</button>
@@ -59,20 +58,21 @@
       <label for="kind">Noise</label>
       <select id="kind" disabled>
         <option value="0">White</option>
-        <option value="1">Pink (1/f)</option>
-        <option value="2">Brown (1/f²)</option>
+        <option value="1">Pink</option>
+        <option value="2">Brown</option>
         <option value="3">Ornstein–Uhlenbeck</option>
+        <option value="4">None (no noise)</option>
       </select>
     </div>
     <div class="row">
-      <label for="wet">Wet</label>
-      <input type="range" id="wet" min="0" max="1" step="0.01" value="1" disabled />
-      <span class="val" id="wetVal">1.00</span>
+      <label for="wet">Cancel</label>
+      <input type="range" id="wet" min="0" max="1" step="0.01" value="0" disabled />
+      <span class="val" id="wetVal">0.00</span>
     </div>
     <div class="row">
-      <label for="mu">μ rate</label>
-      <input type="range" id="mu" min="0.0001" max="0.005" step="0.0001" value="0.001" disabled />
-      <span class="val" id="muVal">0.0010</span>
+      <label for="sweep">Sweep</label>
+      <input type="range" id="sweep" min="0.1" max="10" step="0.1" value="3" disabled />
+      <span class="val" id="sweepVal">0.30 Hz</span>
     </div>
     <div class="status" id="lmsStatus">Ready</div>
   </section>
@@ -94,7 +94,7 @@ const PAGE = 65536;
 const INITIAL_PAGES = 512;   // 32 MiB — one run's scratch fits with room to spare
 const align = (x, a) => (x + (a - 1)) & ~(a - 1);
 
-function createKernel({ url, batchSamples, loopSamples, firTail = 0 }) {
+function createKernel({ url, blockSamples }) {
   let memory, f64, u8, dv, exports = null;
   let bump = 0, OUT_PTR = 0, DESC_PTR = 0, ARENA_BASE = 0;
 
@@ -116,12 +116,13 @@ function createKernel({ url, batchSamples, loopSamples, firTail = 0 }) {
     return p;
   };
   const memcpy = (d, s, n) => { u8.copyWithin(d, s, s + n); return d; };
+  const memset = (d, c, n) => { u8.fill(c & 0xff, d, d + n); return d; };
 
   async function load() {
     memory = new WebAssembly.Memory({ initial: INITIAL_PAGES });
     refreshViews();
     const imports = { env: {
-      memory, malloc, free: () => {}, memcpy,
+      memory, malloc, free: () => {}, memcpy, memset,
       fmod: (a, b) => a % b, sin: Math.sin, cos: Math.cos,
     } };
     const resp = await fetch(url);
@@ -130,11 +131,13 @@ function createKernel({ url, batchSamples, loopSamples, firTail = 0 }) {
     exports = instance.exports;
     exports.__wasm_call_ctors?.();             // run static ctors (initialises data)
 
-    // Persistent output buffer above the kernel heap, then the descriptor,
-    // then the per-call bump arena.
+    // One-block output buffer above the kernel heap, then the descriptor, then
+    // the per-call bump arena. The kernel writes exactly blockSamples per @run
+    // call (memref<blockSamples x f64>); render() calls it repeatedly to fill a
+    // whole loop, so the output region only needs to hold a single block.
     const heapBase = exports.__heap_base.value;
     OUT_PTR    = align(heapBase, 16);
-    DESC_PTR   = align(OUT_PTR + batchSamples * 8, 16);
+    DESC_PTR   = align(OUT_PTR + blockSamples * 8, 16);
     ARENA_BASE = align(DESC_PTR + 32, 16);
 
     // MemRefDescriptor1D: basePtr, data, offset, size, stride. Mirrors the
@@ -142,73 +145,83 @@ function createKernel({ url, batchSamples, loopSamples, firTail = 0 }) {
     dv.setUint32(DESC_PTR +  0, OUT_PTR, true);
     dv.setUint32(DESC_PTR +  4, OUT_PTR, true);
     dv.setBigInt64(DESC_PTR +  8, 0n, true);
-    dv.setBigInt64(DESC_PTR + 16, BigInt(batchSamples), true);
+    dv.setBigInt64(DESC_PTR + 16, BigInt(blockSamples), true);
     dv.setBigInt64(DESC_PTR + 24, 1n, true);
   }
 
-  // Write an exported scalar f64 parameter global (exported as its i32 address).
-  const setParam = (name, value) => { dv.setFloat64(exports[name].value, value, true); };
+  // Write an exported parameter global (exported as its i32 address). f64 knobs
+  // (@mu, @wet) use setParam; @noise_kind is a memref<i64> selector, so it must
+  // be written as an i64 (setParamI64) — writing an f64 bit pattern there would
+  // decode as a huge index and hit the index_switch default (silence).
+  const setParam    = (name, value) => { dv.setFloat64(exports[name].value, value, true); };
+  const setParamI64 = (name, value) => { dv.setBigInt64(exports[name].value, BigInt(value), true); };
 
-  // Run the kernel once, fold any FIR tail so the first loopSamples loop
-  // seamlessly (linear → circular convolution), and copy them out as f32.
+  // Stream `outFloat32.length` samples by invoking the kernel one block at a
+  // time — the browser analogue of the native host's fillBlock() render loop.
+  // The kernel writes exactly blockSamples per @run call and advances its own
+  // --stream state (@sample_offset, LMS weights, noise/filter accumulators, LFO
+  // phase), so consecutive calls form one continuous, seam-free stream. The
+  // output length must be a multiple of blockSamples (the audio callback uses a
+  // buffer size that is).
   function render(outFloat32) {
-    bump = ARENA_BASE;                         // fresh arena per invocation
-    exports._mlir_ciface_run(DESC_PTR);        // native ABI: pointer to descriptor
     const base = OUT_PTR / 8;
-    for (let n = 0; n < firTail; ++n)
-      f64[base + n] += f64[base + loopSamples + n];
-    for (let n = 0; n < loopSamples; ++n)
-      outFloat32[n] = f64[base + n];           // f64 → f32 on copy
+    for (let n = 0; n < outFloat32.length; n += blockSamples) {
+      bump = ARENA_BASE;                       // fresh arena per block
+      exports._mlir_ciface_run(DESC_PTR);      // native ABI: pointer to descriptor
+      for (let i = 0; i < blockSamples; ++i)
+        outFloat32[n + i] = f64[base + i];     // f64 → f32 on copy
+    }
   }
 
-  return { load, setParam, render, get loaded() { return !!exports; } };
+  return { load, setParam, setParamI64, render, get loaded() { return !!exports; } };
 }
 
 // ---------------------------------------------------------------------------
-// Looping player: renders a one-second batch and loops it, crossfading on
-// every regenerate so parameter tweaks stay click-free (the browser analogue
-// of the C++ double-buffer swap). `converge` re-runs the kernel a few times
-// before publishing a buffer, letting stateful kernels (LMS weights) settle.
+// Continuous streaming player: the browser analogue of the native host's render
+// thread + ring buffer. A ScriptProcessorNode pulls fresh audio from the kernel
+// every callback, one block at a time, so the --stream state (tone phase, LFO
+// phase, LMS weights, noise/filter accumulators) advances continuously and the
+// output never loops. This removes the old "loop a 1-second buffer" seam — the
+// cutoff-sweep LFO and 440 Hz tone are now truly continuous, and parameter
+// globals are picked up live on the next block (no regenerate/crossfade needed).
 // ---------------------------------------------------------------------------
 let ctx = null;
 async function ensureAudio() { if (!ctx) ctx = new AudioContext(); await ctx.resume(); }
 
-function createSynth(kernel, { loopSamples, master, converge = 1 }) {
-  let source = null, gain = null;
-  const scratch = new Float32Array(loopSamples);
+function createSynth(kernel, { blockSamples, master, warmupBlocks = 0 }) {
+  // Callback buffer size: a power of two (ScriptProcessor requirement) and a
+  // multiple of the kernel block, so each callback is an exact number of blocks.
+  const BUFFER = 1024;
+  let node = null, gain = null;
 
-  function makeBuffer() {
-    for (let i = 0; i < converge - 1; ++i) kernel.render(scratch); // warm up state
-    const buf = ctx.createBuffer(1, loopSamples, SAMPLE_RATE);
-    kernel.render(buf.getChannelData(0));
-    return buf;
-  }
-  function swap() {
-    const buf = makeBuffer();
-    const src = ctx.createBufferSource();
-    src.buffer = buf; src.loop = true;
-    const g = ctx.createGain();
-    const now = ctx.currentTime;
-    g.gain.setValueAtTime(0, now);
-    g.gain.linearRampToValueAtTime(master, now + 0.03);
-    src.connect(g).connect(ctx.destination);
-    src.start();
-    if (source) {
-      const old = source, og = gain, t = ctx.currentTime;
-      og.gain.setValueAtTime(og.gain.value, t);
-      og.gain.linearRampToValueAtTime(0, t + 0.03);
-      setTimeout(() => { try { old.stop(); } catch {} }, 60);
+  function start() {
+    // Warm up the persistent LMS weights before any audio is audible, so the
+    // first output isn't an unconverged noise burst (native primes a few blocks).
+    if (warmupBlocks) {
+      const scratch = new Float32Array(blockSamples);
+      for (let i = 0; i < warmupBlocks; ++i) kernel.render(scratch);
     }
-    source = src; gain = g;
+    node = ctx.createScriptProcessor(BUFFER, 0, 1);
+    node.onaudioprocess = (e) => kernel.render(e.outputBuffer.getChannelData(0));
+    gain = ctx.createGain();
+    const now = ctx.currentTime;
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(master, now + 0.03); // click-free fade-in
+    node.connect(gain).connect(ctx.destination);
   }
-  function stop() { if (source) { try { source.stop(); } catch {} } source = gain = null; }
-  return { swap, stop, get playing() { return !!source; } };
+  function stop() {
+    if (node) { node.disconnect(); node.onaudioprocess = null; }
+    if (gain) gain.disconnect();
+    node = gain = null;
+  }
+  return { start, stop, get playing() { return !!node; } };
 }
 
 // ---------------------------------------------------------------------------
-// Panel wiring: shared start/stop + debounced parameter → regenerate logic.
-// `controls` are { el, apply } pairs; apply() pushes the control's value into
-// the kernel global and updates its readout.
+// Panel wiring: shared start/stop. `controls` are { el, apply } pairs; apply()
+// pushes the control's value into the kernel global and updates its readout.
+// The running kernel reads its globals once per block, so a control change takes
+// effect on the next block — no regenerate, no debounce.
 // ---------------------------------------------------------------------------
 function wirePanel({ kernel, synth, startBtn, stopBtn, statusEl, controls }) {
   const setEnabled = (on) => controls.forEach(c => { c.el.disabled = !on; });
@@ -221,7 +234,7 @@ function wirePanel({ kernel, synth, startBtn, stopBtn, statusEl, controls }) {
       await ensureAudio();
       if (!kernel.loaded) await kernel.load();
       seed();                                  // push current control values
-      synth.swap();
+      synth.start();
       stopBtn.disabled = false;
       setEnabled(true);
       statusEl.textContent = 'Playing';
@@ -240,42 +253,37 @@ function wirePanel({ kernel, synth, startBtn, stopBtn, statusEl, controls }) {
     statusEl.textContent = 'Stopped';
   });
 
-  let timer = null;
-  for (const c of controls) {
-    c.el.addEventListener('input', () => {
-      c.apply();
-      if (!kernel.loaded || !synth.playing) return;
-      if (timer) return;                       // debounce regenerate (~60 ms)
-      timer = setTimeout(() => { timer = null; synth.swap(); }, 60);
-    });
-  }
+  for (const c of controls)
+    c.el.addEventListener('input', () => c.apply());
 }
 
 // ---- LMS adaptive noise canceller kernel ----------------------------------
 {
-  const LOOP = 44100;                          // one-second batch, no FIR tail
-  const kernel = createKernel({ url: 'lms-noise.linked.wasm',
-    batchSamples: LOOP, loopSamples: LOOP });
-  // Peaks reach ~3.7 (brown, wet=0) → generous headroom; converge lets the
-  // persistent LMS weights adapt before the first audible buffer.
-  const synth = createSynth(kernel, { loopSamples: LOOP, master: 0.25, converge: 6 });
+  const BLOCK = 128, SR = 44100;               // kernel emits 128 samples per @run call
+  const kernel = createKernel({ url: 'lms-noise.linked.wasm', blockSamples: BLOCK });
+  // Peaks reach ~3.7 (brown, wet=0) → generous headroom; warm-up blocks let the
+  // persistent LMS weights adapt before the first audible sample.
+  const synth = createSynth(kernel, { blockSamples: BLOCK, master: 0.25, warmupBlocks: 64 });
 
   const kind = document.getElementById('kind');
   const wet  = document.getElementById('wet');
   const wetVal = document.getElementById('wetVal');
-  const mu   = document.getElementById('mu');
-  const muVal = document.getElementById('muVal');
+  const sweep    = document.getElementById('sweep');
+  const sweepVal = document.getElementById('sweepVal');
+  // @mu (LMS step size) is left at its compiled default (1e-3, from lms-noise.mlir):
+  // small enough that the weights converge over the first few blocks and stay put.
   wirePanel({
     kernel, synth,
     startBtn: document.getElementById('lmsStart'),
     stopBtn:  document.getElementById('lmsStop'),
     statusEl: document.getElementById('lmsStatus'),
     controls: [
-      { el: kind, apply: () => kernel.setParam('noise_kind', +kind.value) },
+      { el: kind, apply: () => kernel.setParamI64('noise_kind', +kind.value) },
       { el: wet,  apply: () => { const w = +wet.value; wetVal.textContent = w.toFixed(2);
         kernel.setParam('wet', w); } },
-      { el: mu,   apply: () => { const m = +mu.value; muVal.textContent = m.toFixed(4);
-        kernel.setParam('mu', m); } },
+      // @lfo_period is the cutoff-sweep period in samples (i64): LFO Hz = SR / period.
+      { el: sweep, apply: () => { const hz = +sweep.value; sweepVal.textContent = `${hz.toFixed(2)} Hz`;
+        kernel.setParamI64('lfo_period', Math.round(SR / hz)); } },
     ],
   });
 }

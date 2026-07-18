@@ -45,7 +45,7 @@ module {
   // LMS adaptation rate (interactive, read at render time inside the kernel).
   memref.global "public" @mu : memref<f64> = dense<1.000000e-03>
   // Wet mix (interactive): fraction of the estimated noise to subtract.
-  memref.global "public" @wet : memref<f64> = dense<1.000000e+00>
+  memref.global "public" @wet : memref<f64> = dense<0.000000e+00>
   // Noise color select (interactive): 0=white 1=pink 2=brown 3=ou, and any
   // other value ("none") = silence. Read once per @run call as the
   // dsp.index_switch selector; v1 assumes exactly this shape (a plain load of
