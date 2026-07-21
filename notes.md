@@ -11,7 +11,7 @@ audio-relevant stateful additions are the colored-noise generators `dsp.noise_wh
 `dsp.lmsFilterResponse`; the samples build pipelines from these plus stateless blocks
 like `dsp.getRangeOfVector` (ramp/broadcast), `dsp.mul/add/sub/div/modulo`, `dsp.sin`,
 `dsp.gain`, `dsp.hamming`, `dsp.lowPassFIRFilter`, `dsp.FIRFilterResponse`, and the
-runtime selector `dsp.index_switch` / `dsp.yield`. Three properties define the WIP design:
+runtime selector `dsp.index_switch` / `dsp.yield`. Four properties define the WIP design:
 
 - **Tensor-based, bufferization-pass-free.** Every `dsp` op operates on `tensor`s in the
   frontend and stays in tensor land through inlining/shape inference. There is no general
@@ -34,6 +34,27 @@ runtime selector `dsp.index_switch` / `dsp.yield`. Three properties define the W
   pattern that used to crash fusion: a 0-D/scalar memref loaded *inside* an elementwise
   loop, e.g. `dsp.gain`'s broadcast. The samples avoid it by broadcasting scalars to
   vectors with `getRangeOfVector` instead of `dsp.gain`.
+- **Fixed block size, block-rate control.** N is a compile-time constant (128 in the
+  samples): `@run` renders exactly N samples per call. We don't plan to change our
+  approach towards event-splitting. Right now, interactive parameters
+  (`@noise_kind`, `@lfo_period`, etc.) are read once at the top of the call and held
+  constant for the whole block. That means they are applied in control-rate and not
+  sample-accurate. This is a deliberate trade-off that keeps the kernel maximally
+  static. In the future, we want to calculate a tensor for each parameter that
+  represents its value over time. For that, we have to change parameters from global
+  variables to setter-functions that provide the MIDI timestamp of the event. If
+  possible, we don't want to sacrifice any of the following optimizations:
+    - **Compile-time trip count.** The N=128 loop bound is a literal, so the backend can
+      fully unroll, constant-fold all block-size arithmetic, and size vector remainders
+      statically -- none of which is possible with a runtime frame count.
+    - **One optimization scope, no barriers.** The whole kernel is a single `@run` function
+      with no internal call/event boundaries, so nothing forces state back to memory or
+      blocks reordering mid-block: loop-invariant work hoists freely and carried state can
+      stay register-resident across the block.
+    - **Whole-block, cross-op fusion.** Because an entire block is processed at once in
+      tensor land, the pointwise chain across ops (`t -> frac -> saw2 -> saw`, etc.) fuses
+      into shared loops over one buffer (the Axis-A A4 work) rather than being pinned apart
+      by per-sample or per-node boundaries.
 
 Compiler-side code lives in `../DSP_MLIR/mlir/examples/dsp/SimpleBlocks` (ops in
 `include/toy/Ops.td`; lowering + the stream/fusion passes in `mlir/LowerToAffineLoops.cpp`;
