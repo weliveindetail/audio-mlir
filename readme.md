@@ -24,10 +24,11 @@ Make sure to use sccache for development.
 ## Build the sample
 
 Right now, this repo only contains one sample app.
-The audio-mlir dialect itself is (still) implemented in-tree in LLVM above.
-The sample plays a sawtooth oscillator through a low-pass filter.
-The filter's cut-off frequency can be adjusted for illustration.
-The entire audio pipeline is defined in the target-agnostic [osc-low-pass.mlir](osc-low-pass.mlir) file.
+The audio-mlir dialect itself is (still) implemented in-tree in the LLVM fork above.
+The sample is an LMS adaptive noise canceller: a swept-filtered sawtooth tone is
+buried in broadband noise, and a 32-tap adaptive FIR removes the noise to reveal
+the tone. The noise color (white/pink/brown/ou/none) is selectable at run time.
+The entire audio pipeline is defined in the target-agnostic [lms-noise.mlir](lms-noise.mlir) file.
 Before we build that, let's checkout the repo:
 ```
 > git clone https://github.com/weliveindetail/audio-mlir samples
@@ -40,8 +41,8 @@ Once the LLVM build finished, we can use `dsp1` to compile our audio pipeline in
 [This sample HTML file](sample-wasm/index.html) illustrates how to load and use it. You can try the [live demo in your browser here](https://weliveindetail.github.io/audio-mlir/sample-wasm/).
 ```
 > ./sample-wasm.sh 
-+ dsp1 osc-low-pass.mlir --emit=wasm -o out/osc-low-pass.wasm
-+ wasm-ld --export=_mlir_ciface_run --export=cutoff ... out/osc-low-pass.wasm -o sample-wasm/osc-low-pass.linked.wasm
++ dsp1 lms-noise.mlir --stream --opt --emit=wasm -o out/lms-noise.wasm
++ wasm-ld --no-entry --import-memory --allow-undefined --export=run --export=_mlir_ciface_run --export=mu --export=wet --export=noise_kind --export=lfo_period ... out/lms-noise.wasm -o sample-wasm/lms-noise.linked.wasm
 + set +x
 Sample is serving at http://localhost:8000/
 Serving HTTP on :: port 8000 (http://[::]:8000/) ...
@@ -50,26 +51,18 @@ Serving HTTP on :: port 8000 (http://[::]:8000/) ...
 ### C++ sample app
 
 The `dsp1` compiler can emit a native object as well.
-[sample-macOS.cpp](sample-macOS.cpp) implements the native CoreAudio wrapper for macOS hosts.
-Use your C++ host toolchain to build it. I only tested on macOS so far:
+[lms-noise-macOS.cpp](lms-noise-macOS.cpp) implements a native CoreAudio driver for macOS hosts.
+Use your C++ host toolchain to build it:
 ```
-> ./sample-macOS.sh
-+ dsp1 osc-low-pass.mlir --emit=llvm
-+ llc out/osc-low-pass-native.ll -filetype=obj -o out/osc-low-pass-native.o
-+ clang++ -O3 sample-macOS.cpp out/osc-low-pass-native.o -framework AudioToolbox -framework CoreAudio -o out/sample-macOS
+> ./lms-noise-macOS.sh
++ dsp1 lms-noise.mlir --stream --emit=llvm --opt -o out/lms-noise-native.ll
++ llc out/lms-noise-native.ll -filetype=obj -o out/lms-noise-native.o
++ clang++ -O3 lms-noise-macOS.cpp out/lms-noise-native.o -framework AudioToolbox -framework CoreAudio -o out/lms-noise-macOS
+Built out/lms-noise-macOS -- run it to hear the demo.
 
-> ./out/sample-macOS
-Initializing macOS Core Audio Engine...
-
-==============================================
-   CoreAudio Low-Pass Filter Synth Running!   
-==============================================
- -> Press [UP Arrow]   to raise the cut-off frequency
- -> Press [DOWN Arrow] to lower the cut-off frequency
+> ./out/lms-noise-macOS
+ -> Up / Down arrows    to adjust @wet (how much noise to remove)
+ -> Left / Right arrows to cycle @noise_kind (white/pink/brown/ou/none)
+ -> + / - keys          to change @lfo_period (cutoff-sweep speed)
  -> Press [Q] or Ctrl+C to stop the program safely
-==============================================
-
-Cut-off Frequency: 2100.0 Hz   
-
-Stopping audio engine and cleaning up channels...
 ```
