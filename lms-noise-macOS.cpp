@@ -54,10 +54,14 @@ extern "C" double wet;        // @wet: how much of the noise estimate to subtrac
 extern "C" int64_t noise_kind;
 
 // @lfo_period: the cutoff-sweep LFO period in samples (the automation *speed*).
-// Smaller = faster sweep. The kernel computes the triangle phase as
-// @sample_offset mod @lfo_period, so this is read once per @run. Adjusted by the
-// +/- keys; kept strictly positive and within a musically sensible band.
-extern "C" int64_t lfo_period;
+// Smaller = faster sweep. This parameter is no longer a directly-written global:
+// the kernel now exposes a *timestamped setter*, @set_value_lfo_period(value,
+// frame), and interpolates the change via its phase accumulator (see the
+// lms-noise.mlir header). The host schedules a new value with a frame offset
+// into the next block; here the +/- keys apply at frame 0 (start of next block).
+// We keep a host-side shadow of the current value purely for the status display.
+extern "C" void _mlir_ciface_set_value_lfo_period(int64_t value, int64_t frame);
+static int64_t gLfoPeriod = 147000; // mirrors the kernel's @lfo_period default
 
 // Automation-speed bounds (samples at 44100): ~10 Hz (fast) to ~0.05 Hz (~20 s).
 constexpr int64_t LFO_PERIOD_MIN = 4410;   // 44100 / 10  -> 10 Hz
@@ -145,17 +149,21 @@ static const char *currentKindName() {
 
 // Current cutoff-sweep rate in Hz (LFO frequency = sample rate / period).
 static double lfoHz() {
-    return SAMPLE_RATE / static_cast<double>(lfo_period);
+    return SAMPLE_RATE / static_cast<double>(gLfoPeriod);
 }
 
 // Scale the automation speed by `factor` (>1 = faster sweep -> shorter period),
 // clamped to the sensible band. Rounds so the period stays a whole number.
+// Instead of writing the @lfo_period global directly, schedule the change via
+// the kernel's timestamped setter at frame 0 (apply from the start of the next
+// rendered block); the kernel's phase accumulator interpolates it click-free.
 static void scaleLfoSpeed(double factor) {
-    double p = static_cast<double>(lfo_period) / factor; // faster => smaller period
+    double p = static_cast<double>(gLfoPeriod) / factor; // faster => smaller period
     int64_t np = static_cast<int64_t>(p + 0.5);
     if (np < LFO_PERIOD_MIN) np = LFO_PERIOD_MIN;
     if (np > LFO_PERIOD_MAX) np = LFO_PERIOD_MAX;
-    lfo_period = np;
+    gLfoPeriod = np;
+    _mlir_ciface_set_value_lfo_period(np, /*frame=*/0);
 }
 
 // Reprint the single status line (wet %, noise color, and sweep speed).

@@ -60,8 +60,17 @@ module {
   memref.global "public" @sample_offset : memref<i64> = dense<0>
   // Low-pass cutoff-LFO period in samples (interactive): the automation speed.
   // A smaller period = faster sweep (LFO Hz = 44100 / period; default 147000 ≈
-  // 0.3 Hz). The host writes this from the +/- keys; must stay > 0 (host clamps).
+  // 0.3 Hz). This is now the *held/current* value of the parameter: the host no
+  // longer writes it directly but schedules changes via @set_value_lfo_period,
+  // and @run commits the pending value into this global at the end of the block.
   memref.global "public" @lfo_period : memref<i64> = dense<147000>
+  // Pending @lfo_period value + the frame (0..N) at which it takes effect within
+  // the next block -- the timestamped-setter state record (phase-mode param).
+  // frame == N (=128) means "no pending change". @set_value_lfo_period writes
+  // these; @run reads them to advance the LFO phase sample-accurately, then
+  // commits (@lfo_period := pending, frame := N).
+  memref.global "public" @lfo_period_pending : memref<i64> = dense<147000>
+  memref.global "public" @lfo_period_frame : memref<i64> = dense<128>
   // Cutoff-LFO phase accumulator, one cycle = [0,1). Each @run advances it by
   // N/@lfo_period and stores it back, so changing @lfo_period only changes the
   // per-block *increment*, never the accumulated phase -- rate changes are then
@@ -175,44 +184,76 @@ module {
     %saw   = "dsp.sub"(%saw2, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>     // 2*frac - 1
 
     // --- automated low-pass on the tone: cutoff swept by a slow in-kernel LFO ---
-    // alpha (the 1st-order IIR coefficient) is recomputed once per @run from a
-    // ~0.3 Hz triangle over @sample_offset -- an "automated parameter" driven
-    // entirely in-kernel, no host involvement. Read once and held for the block
-    // (block-rate automation); N=128 (~2.9 ms) keeps the sweep step-free.
-    // dsp.lowPassFilter carries --stream state (its previous output), so the
-    // filtered tone is continuous across calls (no per-block click). Applied to
-    // the sawtooth here (the signal path), so the sweep is audible as a timbral
-    // change, not just amplitude. Triangle is pure arith (|2f-1| via cmp/select).
-    %lp2    = arith.constant 2.000000e+00 : f64
-    %lp1    = arith.constant 1.000000e+00 : f64
-    %lp0    = arith.constant 0.000000e+00 : f64
-    %lpPmem = memref.get_global @lfo_period : memref<i64>  // interactive sweep speed
-    %lpP    = memref.load %lpPmem[] : memref<i64>         // LFO period (samples)
+    // The cutoff coefficient alpha is now materialised PER SAMPLE as a
+    // tensor<128xf64> (a smooth in-block sweep) rather than one control-rate
+    // value held for the whole block. The LFO is a phase accumulator -- the
+    // "phase-mode interpolation" of the @lfo_period parameter: from the running
+    // phase phase0 and the held period P0 we build phase[n] = phase0 + n/P0,
+    // wrap to [0,1), and map a triangle to alpha[n] = 0.02 + 0.33*tri[n].
+    // dsp.lowPassFilter now consumes this per-sample (rank-1) alpha; it still
+    // carries --stream state (its previous output), so the tone is continuous
+    // across calls. Applied to the sawtooth (the signal path), so the sweep is
+    // an audible timbral change. Built entirely from tensor ops (getRangeOfVector
+    // ramp, modulo wrap, abs for |2f-1|), so it stays in tensor land.
+    %one1f  = arith.constant 1.000000e+00 : f64
+    %blkf   = arith.constant 1.280000e+02 : f64          // N (block size)
+    // held/current period P0 and the running LFO phase at block start.
+    %lpPmem = memref.get_global @lfo_period : memref<i64>
+    %lpP    = memref.load %lpPmem[] : memref<i64>
     %lpPf   = arith.sitofp %lpP : i64 to f64
-    // Phase accumulator: read the persistent 0..1 phase, use it for THIS block,
-    // then advance by N/period and store back. Since only the increment depends
-    // on @lfo_period, changing the sweep speed never jumps the phase (click-free).
     %phmem  = memref.get_global @lfo_phase : memref<f64>
-    %lpfrac = memref.load %phmem[] : memref<f64>          // current phase 0..1
-    %blkf   = arith.constant 1.280000e+02 : f64           // N (block size)
-    %lpinc  = arith.divf %blkf, %lpPf : f64               // cycles advanced per block (<1)
-    %phraw  = arith.addf %lpfrac, %lpinc : f64
-    %phge1  = arith.cmpf oge, %phraw, %lp1 : f64          // wrap: inc<1 so one subtract suffices
-    %phsub  = arith.subf %phraw, %lp1 : f64
-    %phnext = arith.select %phge1, %phsub, %phraw : f64   // wrap to 0..1
+    %phase0 = memref.load %phmem[] : memref<f64>         // phase at start of block
+    // per-sample phase increment incHeld = 1/P0 (cycles per sample), then
+    // phase[n] = phase0 + n*incHeld as a tensor, wrapped to [0,1).
+    %incH   = arith.divf %one1f, %lpPf : f64
+    %incHt  = tensor.from_elements %incH   : tensor<f64>
+    %ph0t   = tensor.from_elements %phase0 : tensor<f64>
+    %phRamp = "dsp.getRangeOfVector"(%ph0t, %cnt, %incHt) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
+    %phW    = "dsp.modulo"(%phRamp, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    // triangle tri[n] = 1 - |2*phase - 1|  (0 at edges, 1 at centre), per sample.
+    %ph2    = "dsp.add"(%phW, %phW) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    %ph2m1  = "dsp.sub"(%ph2, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    %phAbs  = "dsp.abs"(%ph2m1) : (tensor<128xf64>) -> tensor<128xf64>
+    %triV   = "dsp.sub"(%ones, %phAbs) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    // alpha[n] = 0.02 + 0.33 * tri[n]  -> in [0.02, 0.35], as a per-sample tensor.
+    %c033   = dsp.constant dense<3.300000e-01> : tensor<f64>   // span -> up to ~0.35 (bright)
+    %c002   = dsp.constant dense<2.000000e-02> : tensor<f64>   // muffled floor (~140 Hz)
+    %spanV  = "dsp.getRangeOfVector"(%c033, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
+    %aminV  = "dsp.getRangeOfVector"(%c002, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
+    %amodV  = "dsp.mul"(%triV, %spanV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    %alphaV = "dsp.add"(%amodV, %aminV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    %tone   = "dsp.lowPassFilter"(%saw, %alphaV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+
+    // --- advance the LFO phase, honouring the timestamped @lfo_period change ---
+    // A pending change (scheduled by @set_value_lfo_period with a frame
+    // timestamp) takes effect at frame f within THIS block: the phase advances at
+    // the held rate 1/P0 for f samples and the pending rate 1/Pp for the
+    // remaining N-f, so the exact event frame is reflected in the carried phase
+    // (sample-accurate), even though the within-block alpha ramp above uses the
+    // held period (the pending period becomes the ramp slope from next block).
+    // f == N (=128) means "no pending change" (advance = N/P0, as before).
+    // Advancing only the increment (not re-deriving phase from a counter) keeps
+    // sweep-speed changes click-free.
+    %ppMem  = memref.get_global @lfo_period_pending : memref<i64>
+    %ppI    = memref.load %ppMem[] : memref<i64>
+    %ppF    = arith.sitofp %ppI : i64 to f64
+    %frMem  = memref.get_global @lfo_period_frame : memref<i64>
+    %frI    = memref.load %frMem[] : memref<i64>
+    %frF    = arith.sitofp %frI : i64 to f64
+    %incP   = arith.divf %one1f, %ppF : f64              // 1/pending
+    %nMinF  = arith.subf %blkf, %frF : f64               // N - f
+    %advH   = arith.mulf %frF, %incH : f64               // f/P0
+    %advP   = arith.mulf %nMinF, %incP : f64             // (N-f)/pending
+    %adv    = arith.addf %advH, %advP : f64
+    %phraw  = arith.addf %phase0, %adv : f64
+    %phge1  = arith.cmpf oge, %phraw, %one1f : f64       // inc<1 so one subtract suffices
+    %phsub  = arith.subf %phraw, %one1f : f64
+    %phnext = arith.select %phge1, %phsub, %phraw : f64  // wrap to [0,1)
     memref.store %phnext, %phmem[] : memref<f64>
-    %lp2f   = arith.mulf %lpfrac, %lp2 : f64
-    %lp2fm1 = arith.subf %lp2f, %lp1 : f64               // -1..1
-    %lpneg  = arith.negf %lp2fm1 : f64
-    %lpisn  = arith.cmpf olt, %lp2fm1, %lp0 : f64
-    %lpabs  = arith.select %lpisn, %lpneg, %lp2fm1 : f64 // |2f-1|
-    %lptri  = arith.subf %lp1, %lpabs : f64              // 0 at edges, 1 at center
-    %lpamin = arith.constant 2.000000e-02 : f64          // muffled floor (~140 Hz)
-    %lpaspn = arith.constant 3.300000e-01 : f64          // span -> up to ~0.35 (bright)
-    %lpamod = arith.mulf %lptri, %lpaspn : f64
-    %lpaf   = arith.addf %lpamod, %lpamin : f64          // alpha in [0.02, 0.35]
-    %lpalpha = tensor.from_elements %lpaf : tensor<f64>
-    %tone   = "dsp.lowPassFilter"(%saw, %lpalpha) : (tensor<128xf64>, tensor<f64>) -> tensor<128xf64>
+    // commit: held := pending, and mark the event consumed (frame := N).
+    memref.store %ppI, %lpPmem[] : memref<i64>
+    %blkI   = arith.constant 128 : i64
+    memref.store %blkI, %frMem[] : memref<i64>
 
     // --- desired d[n] = tone + colored noise ---
     %d = "dsp.add"(%tone, %n0) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
@@ -231,5 +272,21 @@ module {
     %wy     = "dsp.gain"(%y, %wet) : (tensor<128xf64>, tensor<f64>) -> tensor<128xf64>
     %outt   = "dsp.sub"(%d, %wy) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
     dsp.return %outt : tensor<128xf64>
+  }
+
+  // Timestamped parameter setter (out-of-band ABI, exported as
+  // _mlir_ciface_set_value_lfo_period). The host calls this -- instead of
+  // writing @lfo_period directly -- to schedule a new sweep-speed value that
+  // takes effect at frame `frame` (0..N) within the next block. It just records
+  // the pending value and frame into the parameter's state globals; @run above
+  // consumes them (phase-mode interpolation) and commits. This is the first
+  // prototype of the notes.md "parameters become setter-functions carrying a
+  // MIDI timestamp" direction, kept in raw MLIR (no new dsp op yet).
+  dsp.func @set_value_lfo_period(%value: i64, %frame: i64) attributes {llvm.emit_c_interface} {
+    %pmem = memref.get_global @lfo_period_pending : memref<i64>
+    memref.store %value, %pmem[] : memref<i64>
+    %fmem = memref.get_global @lfo_period_frame : memref<i64>
+    memref.store %frame, %fmem[] : memref<i64>
+    dsp.return
   }
 }
