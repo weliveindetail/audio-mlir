@@ -78,6 +78,33 @@ module {
   // changes). Store 0 to restart the sweep from its muffled edge.
   memref.global "public" @lfo_phase : memref<f64> = dense<0.000000e+00>
 
+  // --- Mode B: host-side LFO (breakpoint-envelope) state --------------------
+  // @lfo_mode selects who computes the cutoff-alpha sweep, read once per block:
+  //   0 = KERNEL-side  (the phase-accumulator triangle above; @lfo_period),
+  //   1 = HOST-side    (arbitrary shape streamed as breakpoints; below).
+  // Both alphas are always computed; @run blends by mode (m in {0,1}) as
+  // alpha = (1-m)*alphaKernel + m*alphaHost, so switching is branch-free.
+  memref.global "public" @lfo_mode : memref<i64> = dense<0>
+  // Breakpoint array (Mode B input): ONE slot per frame in the upcoming block,
+  // slot index == frame. @set_value_lfo_breakpoint(value, frame) writes
+  // @lfo_bp[frame] = value; @run linearly interpolates between the occupied
+  // slots to fill a per-sample alpha. Empty slots hold the SENTINEL -1.0 (out of
+  // the valid alpha range [0.02,0.35]); @run resets every slot back to -1.0 as
+  // it consumes them, so a slot left untouched next block reads as "no anchor".
+  memref.global "public" @lfo_bp : memref<128xf64> = dense<-1.000000e+00>
+  // Per-sample host alpha buffer, filled by the interpolation loop in @run and
+  // lifted into tensor land via dsp.fromGlobal (this toolchain has no
+  // bufferization/to_tensor hook, so a hand-written loop result reaches the
+  // tensor-typed low-pass only through that bridge op). Private scratch.
+  memref.global "private" @lfo_alpha_host : memref<128xf64> = dense<2.000000e-02>
+  // Scratch for the interpolator's backward pass: per sample, the value/frame of
+  // the nearest breakpoint at-or-after it (rf == 128.0 means "none ahead").
+  memref.global "private" @lfo_rv : memref<128xf64> = dense<0.000000e+00>
+  memref.global "private" @lfo_rf : memref<128xf64> = dense<1.280000e+02>
+  // Mode-B continuity: alpha at the end of the previous block, so the first
+  // segment of the next block ramps from where the last one ended (no click).
+  memref.global "public" @lfo_alpha_carry : memref<f64> = dense<2.000000e-02>
+
   // BLOCK SIZE: N = 128 samples per @run call (~2.9 ms at 44100). Small on
   // purpose: parameters are read once per call (control-rate == block-rate), so
   // a small N keeps automation smooth -- e.g. the low-pass cutoff LFO below
@@ -215,13 +242,92 @@ module {
     %ph2m1  = "dsp.sub"(%ph2, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
     %phAbs  = "dsp.abs"(%ph2m1) : (tensor<128xf64>) -> tensor<128xf64>
     %triV   = "dsp.sub"(%ones, %phAbs) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    // alpha[n] = 0.02 + 0.33 * tri[n]  -> in [0.02, 0.35], as a per-sample tensor.
+    // alphaKernel[n] = 0.02 + 0.33 * tri[n]  -> in [0.02, 0.35], per sample. This
+    // is Mode A (kernel-side LFO). Mode B replaces it with a host-streamed shape.
     %c033   = dsp.constant dense<3.300000e-01> : tensor<f64>   // span -> up to ~0.35 (bright)
     %c002   = dsp.constant dense<2.000000e-02> : tensor<f64>   // muffled floor (~140 Hz)
     %spanV  = "dsp.getRangeOfVector"(%c033, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
     %aminV  = "dsp.getRangeOfVector"(%c002, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
     %amodV  = "dsp.mul"(%triV, %spanV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    %alphaV = "dsp.add"(%amodV, %aminV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    %alphaKV = "dsp.add"(%amodV, %aminV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+
+    // --- Mode B: HOST-side LFO (breakpoint-envelope interpolation) ------------
+    // The host streams a sparse shape into @lfo_bp (slot == frame, empty == -1.0
+    // sentinel). We fill a per-sample alpha by piecewise-LINEAR interpolation
+    // between the occupied slots -- a scan that pure tensor ops can't express (no
+    // elementwise select / prefix), so it is a hand-written affine.for pair
+    // writing memrefs, bridged back to tensor land by dsp.fromGlobal. For a
+    // triangle this reproduces Mode A exactly (a triangle IS piecewise-linear);
+    // for any other breakpoint set it draws an arbitrary shape.
+    %sent   = arith.constant -1.000000e+00 : f64                // "no anchor here"
+    %c127i  = arith.constant 127 : index
+    %bpMem  = memref.get_global @lfo_bp : memref<128xf64>
+    %rvMem  = memref.get_global @lfo_rv : memref<128xf64>
+    %rfMem  = memref.get_global @lfo_rf : memref<128xf64>
+    %ahMem  = memref.get_global @lfo_alpha_host : memref<128xf64>
+    %acMem  = memref.get_global @lfo_alpha_carry : memref<f64>
+    %carry0 = memref.load %acMem[] : memref<f64>                 // alpha at end of prev block
+    // Backward pass: for each sample n (127..0) record the nearest anchor
+    // at-or-after it -- value into @lfo_rv, frame into @lfo_rf (128.0 == none).
+    %rv0 = arith.constant 0.000000e+00 : f64
+    %rf0 = arith.constant 1.280000e+02 : f64
+    affine.for %i = 0 to 128 iter_args(%rvAcc = %rv0, %rfAcc = %rf0) -> (f64, f64) {
+      %nb    = arith.subi %c127i, %i : index
+      %nib   = arith.index_cast %nb : index to i64
+      %nfb   = arith.sitofp %nib : i64 to f64
+      %bvb   = memref.load %bpMem[%nb] : memref<128xf64>
+      %isbpb = arith.cmpf one, %bvb, %sent : f64
+      %rvN   = arith.select %isbpb, %bvb, %rvAcc : f64
+      %rfN   = arith.select %isbpb, %nfb, %rfAcc : f64
+      memref.store %rvN, %rvMem[%nb] : memref<128xf64>
+      memref.store %rfN, %rfMem[%nb] : memref<128xf64>
+      affine.yield %rvN, %rfN : f64, f64
+    }
+    // Forward pass: carry the nearest anchor at-or-before (pv,pf); interpolate to
+    // the right anchor (rv,rf); hold when there is none ahead (rf==128) or we sit
+    // exactly on an anchor (denom==0). Reset each consumed slot to the sentinel.
+    // The 3rd iter_arg carries the last alpha so we can store the block-end value.
+    %pf0 = arith.constant 0.000000e+00 : f64
+    %maxfr = arith.constant 1.280000e+02 : f64
+    %la:3 = affine.for %m = 0 to 128 iter_args(%pv = %carry0, %pf = %pf0, %laAcc = %carry0) -> (f64, f64, f64) {
+      %mi    = arith.index_cast %m : index to i64
+      %mf    = arith.sitofp %mi : i64 to f64
+      %bvf   = memref.load %bpMem[%m] : memref<128xf64>
+      %isbpf = arith.cmpf one, %bvf, %sent : f64
+      %pvN   = arith.select %isbpf, %bvf, %pv : f64
+      %pfN   = arith.select %isbpf, %mf, %pf : f64
+      %rv    = memref.load %rvMem[%m] : memref<128xf64>
+      %rf    = memref.load %rfMem[%m] : memref<128xf64>
+      %denom = arith.subf %rf, %pfN : f64
+      %none  = arith.cmpf oge, %rf, %maxfr : f64                 // no anchor ahead
+      %zeroD = arith.cmpf oeq, %denom, %pf0 : f64                // denom == 0
+      %hold  = arith.ori %none, %zeroD : i1
+      %safeD = arith.select %hold, %one1f, %denom : f64          // avoid div-by-zero
+      %dv    = arith.subf %rv, %pvN : f64
+      %slope = arith.divf %dv, %safeD : f64
+      %dn    = arith.subf %mf, %pfN : f64
+      %step  = arith.mulf %dn, %slope : f64
+      %interp = arith.addf %pvN, %step : f64
+      %alpha = arith.select %hold, %pvN, %interp : f64
+      memref.store %alpha, %ahMem[%m] : memref<128xf64>
+      memref.store %sent, %bpMem[%m] : memref<128xf64>           // consume: reset slot
+      affine.yield %pvN, %pfN, %alpha : f64, f64, f64
+    }
+    memref.store %la#2, %acMem[] : memref<f64>                   // carry block-end alpha
+    %alphaHV = "dsp.fromGlobal"() {global = @lfo_alpha_host} : () -> tensor<128xf64>
+
+    // --- blend by mode: alpha = (1-m)*alphaKernel + m*alphaHost, m in {0,1} ---
+    %mdMem  = memref.get_global @lfo_mode : memref<i64>
+    %mdI    = memref.load %mdMem[] : memref<i64>
+    %mdF    = arith.sitofp %mdI : i64 to f64
+    %omF    = arith.subf %one1f, %mdF : f64
+    %mdT    = tensor.from_elements %mdF : tensor<f64>
+    %omT    = tensor.from_elements %omF : tensor<f64>
+    %mdV    = "dsp.getRangeOfVector"(%mdT, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
+    %omV    = "dsp.getRangeOfVector"(%omT, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
+    %aKw    = "dsp.mul"(%alphaKV, %omV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    %aHw    = "dsp.mul"(%alphaHV, %mdV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
+    %alphaV = "dsp.add"(%aKw, %aHw) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
     %tone   = "dsp.lowPassFilter"(%saw, %alphaV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
 
     // --- advance the LFO phase, honouring the timestamped @lfo_period change ---
@@ -287,6 +393,21 @@ module {
     memref.store %value, %pmem[] : memref<i64>
     %fmem = memref.get_global @lfo_period_frame : memref<i64>
     memref.store %frame, %fmem[] : memref<i64>
+    dsp.return
+  }
+
+  // Mode-B breakpoint setter (exported as _mlir_ciface_set_value_lfo_breakpoint).
+  // The host calls it -- typically several times per block -- to place a shape
+  // breakpoint: @lfo_bp[frame] = value, i.e. "alpha should reach `value` at frame
+  // `frame` within the next block". @run interpolates linearly between the
+  // occupied slots and resets them to the -1.0 sentinel as it consumes them.
+  // NOTE: for now the host must not call this while @run is consuming the array
+  // (no cross-thread guard yet); a future revision rejects writes during
+  // consumption. `frame` is assumed in [0,128).
+  dsp.func @set_value_lfo_breakpoint(%value: f64, %frame: i64) attributes {llvm.emit_c_interface} {
+    %bpmem = memref.get_global @lfo_bp : memref<128xf64>
+    %idx   = arith.index_cast %frame : i64 to index
+    memref.store %value, %bpmem[%idx] : memref<128xf64>
     dsp.return
   }
 }

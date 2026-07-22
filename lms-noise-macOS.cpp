@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <thread>
@@ -63,6 +64,22 @@ extern "C" int64_t noise_kind;
 extern "C" void _mlir_ciface_set_value_lfo_period(int64_t value, int64_t frame);
 static int64_t gLfoPeriod = 147000; // mirrors the kernel's @lfo_period default
 
+// @lfo_mode: who computes the cutoff-sweep. 0 = KERNEL-side (the kernel's own
+// phase-accumulator triangle), 1 = HOST-side (this program computes an arbitrary
+// sweep SHAPE and streams it into the kernel as per-sample breakpoints). Toggled
+// with the 'M' key. Mode B is the "heavy parameter traffic" path: each rendered
+// block the host fires a burst of timestamped breakpoints through the setter
+// below, and the kernel linearly interpolates them into the same alpha it would
+// otherwise synthesize itself -- so an arbitrary shape, not just the triangle.
+extern "C" int64_t lfo_mode;                    // the DSL's @lfo_mode global
+extern "C" void _mlir_ciface_set_value_lfo_breakpoint(double value, int64_t frame);
+static int64_t gLfoMode = 0;                    // host shadow of @lfo_mode (display)
+static double  gHostPhase = 0.0;                // host LFO phase accumulator, [0,1)
+// Breakpoints per block: sample the shape every LFO_BP_STRIDE frames (plus the
+// block-end frame). 128/8 = 16 => ~16 setter calls per block, the heavy traffic
+// this mode exists to exercise. The kernel linearly interpolates between them.
+constexpr int LFO_BP_STRIDE = 8;
+
 // Automation-speed bounds (samples at 44100): ~10 Hz (fast) to ~0.05 Hz (~20 s).
 constexpr int64_t LFO_PERIOD_MIN = 4410;   // 44100 / 10  -> 10 Hz
 constexpr int64_t LFO_PERIOD_MAX = 882000; // 44100 * 20  -> 0.05 Hz
@@ -105,6 +122,8 @@ static std::atomic<size_t> gTail{0}; // next read index  (consumer)
 // at a time, so wet / noise_kind changes written from the keyboard thread are
 // picked up within a block or two. Renders into a scratch block then copies into
 // the ring (the kernel needs a contiguous 512-wide memref).
+static void emitLfoBlock(); // defined below (with the LFO helpers)
+
 static void renderLoop() {
     double scratch[BLOCK_SAMPLES];
     while (gRunning.load(std::memory_order_relaxed)) {
@@ -116,6 +135,7 @@ static void renderLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
+        emitLfoBlock();  // Mode B: stream this block's LFO shape as breakpoints
         fillBlock(scratch);
         for (size_t i = 0; i < BLOCK_SAMPLES; ++i)
             gRing[(head + i) & RING_MASK] = scratch[i];
@@ -166,10 +186,41 @@ static void scaleLfoSpeed(double factor) {
     _mlir_ciface_set_value_lfo_period(np, /*frame=*/0);
 }
 
+// The host-side LFO shape as a function of phase in [0,1). Default: the SAME
+// triangle the kernel synthesizes in Mode A -- alpha = 0.02 + 0.33*(1-|2f-1|) --
+// so the two modes sound alike (a clean A/B check). Swap this body for any
+// function to get an arbitrary cutoff-sweep shape, which is the whole point of
+// the host-side mode (the kernel triangle can only ever be a triangle).
+static double lfoShape(double phase) {
+    double frac = phase - std::floor(phase);
+    double tri = 1.0 - std::fabs(2.0 * frac - 1.0);
+    return 0.02 + 0.33 * tri;
+}
+
+// Per-block host LFO update, called on the render thread right before the kernel
+// invocation. Always advances the host phase (so toggling modes stays roughly
+// continuous); only STREAMS breakpoints when Mode B is active. Because it runs
+// immediately before _mlir_ciface_run on the same thread, the breakpoint writes
+// and the kernel's consume/reset of @lfo_bp are strictly sequential -- no
+// cross-thread race on the array.
+static void emitLfoBlock() {
+    double inc = 1.0 / static_cast<double>(gLfoPeriod); // cycles per sample
+    if (lfo_mode != 0) {
+        const int N = static_cast<int>(BLOCK_SAMPLES);
+        for (int f = 0; f < N; f += LFO_BP_STRIDE)
+            _mlir_ciface_set_value_lfo_breakpoint(lfoShape(gHostPhase + f * inc), f);
+        // Anchor the final frame so the last segment ramps to the right value
+        // instead of the interpolator holding the previous breakpoint flat.
+        _mlir_ciface_set_value_lfo_breakpoint(lfoShape(gHostPhase + (N - 1) * inc), N - 1);
+    }
+    gHostPhase += BLOCK_SAMPLES * inc;
+    gHostPhase -= std::floor(gHostPhase); // keep in [0,1)
+}
+
 // Reprint the single status line (wet %, noise color, and sweep speed).
 static void printStatus() {
-    printf("\rNoise reduction: %3.0f%%   |   Noise color: %-6s |   Sweep: %5.2f Hz ",
-           wet * 100.0, currentKindName(), lfoHz());
+    printf("\rNoise reduction: %3.0f%%   |   Noise color: %-6s |   Sweep: %5.2f Hz   |   LFO: %-6s ",
+           wet * 100.0, currentKindName(), lfoHz(), lfo_mode ? "HOST" : "KERNEL");
     fflush(stdout);
 }
 
@@ -329,6 +380,7 @@ int main() {
     std::cout << " -> [UP/DOWN]     more / less cancellation (toward a clean tone)" << std::endl;
     std::cout << " -> [LEFT/RIGHT]  cycle noise color (white/pink/brown/ou/none)" << std::endl;
     std::cout << " -> [+ / -]       cutoff-sweep speed (faster / slower)" << std::endl;
+    std::cout << " -> [M]           LFO source: KERNEL triangle vs HOST breakpoints" << std::endl;
     std::cout << " -> [Q] or Ctrl+C to stop the program safely" << std::endl;
     std::cout << "==============================================\n" << std::endl;
 
@@ -346,6 +398,14 @@ int main() {
         }
         if (c == '-' || c == '_') {
             scaleLfoSpeed(1.0 / LFO_STEP);
+            printStatus();
+            continue;
+        }
+        // 'M' toggles who computes the cutoff-sweep LFO: the kernel's own triangle
+        // (Mode A) or the host streaming an arbitrary shape as breakpoints (B).
+        if (c == 'm' || c == 'M') {
+            gLfoMode ^= 1;
+            lfo_mode = gLfoMode;
             printStatus();
             continue;
         }
