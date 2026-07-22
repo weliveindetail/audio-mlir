@@ -37,6 +37,9 @@
   .curve-tools button { padding:.4rem .8rem; font-size:.8rem; }
   .curve-tools button.active { background:#238636; border-color:#2ea043; color:#fff; }
   .curve-tools select { flex:0 0 auto; padding:.4rem .6rem; font-size:.8rem; }
+  .curve-more { display:contents; }          /* tool buttons stay flex items of the row */
+  .curve.collapsed .curve-more,
+  .curve.collapsed #curvePanel { display:none; }   /* only the "LFO shape" button remains */
   canvas#curve { background:#090a0f; border:1px solid #21262d; border-radius:7px;
                  cursor:crosshair; display:block; width:100%; height:auto; }
   .curve-hint { font-size:.75rem; color:#8b949e; margin:.5rem 0 0; }
@@ -87,22 +90,27 @@
       <input type="range" id="sweep" min="0.1" max="10" step="0.1" value="3" disabled />
       <span class="val" id="sweepVal">3.00 Hz</span>
     </div>
-    <div class="curve">
+    <div class="curve" id="curveWrap">
       <div class="curve-tools">
-        <button id="curveDraw" class="active" disabled>Draw</button>
-        <button id="curveErase" disabled>Erase</button>
-        <button id="curveTriangle" disabled>Triangle</button>
-        <button id="curveSine" disabled>Sine</button>
-        <button id="curveClear" disabled>Clear</button>
-        <select id="curveInterp" disabled>
-          <option value="linear">Linear</option>
-          <option value="cosine">Cosine</option>
-        </select>
+        <button id="curveToggle" class="active">LFO shape</button>
+        <span class="curve-more">
+          <button id="curveDraw" class="active" disabled>Draw</button>
+          <button id="curveErase" disabled>Erase</button>
+          <button id="curveTriangle" disabled>Triangle</button>
+          <button id="curveSine" disabled>Sine</button>
+          <button id="curveClear" disabled>Clear</button>
+          <select id="curveInterp" disabled>
+            <option value="linear">Linear</option>
+            <option value="cosine">Cosine</option>
+          </select>
+        </span>
       </div>
-      <canvas id="curve" width="640" height="180"></canvas>
-      <p class="curve-hint">Draw the LFO cutoff-sweep shape (one cycle over 128 slots):
-        click/drag to place points, Erase to remove them; gaps are interpolated.</p>
-      <textarea id="curveOut" readonly></textarea>
+      <div id="curvePanel">
+        <canvas id="curve" width="640" height="180"></canvas>
+        <p class="curve-hint">Draw the LFO cutoff-sweep shape (one cycle over 128 slots):
+          click/drag to place points, Erase to remove them; gaps are interpolated.</p>
+        <textarea id="curveOut" readonly></textarea>
+      </div>
     </div>
     <div class="status" id="lmsStatus">Ready</div>
   </section>
@@ -251,7 +259,10 @@ function createKernel({ url, blockSamples }) {
     }
   }
 
-  return { load, setParam, setParamI64, setLfoPeriod, setCurve, render, get loaded() { return !!exports; } };
+  return { load, setParam, setParamI64, setLfoPeriod, setCurve, render,
+    getPhase: () => hostPhase,          // generation phase within the LFO cycle [0,1)
+    getRate:  () => 1 / lfoPeriod,      // cycles advanced per sample
+    get loaded() { return !!exports; } };
 }
 
 // ---------------------------------------------------------------------------
@@ -266,11 +277,23 @@ function createKernel({ url, blockSamples }) {
 let ctx = null;
 async function ensureAudio() { if (!ctx) ctx = new AudioContext(); await ctx.resume(); }
 
-function createSynth(kernel, { blockSamples, master, warmupBlocks = 0 }) {
+function createSynth(kernel, { blockSamples, master, warmupBlocks = 0, onTick }) {
   // Callback buffer size: a power of two (ScriptProcessor requirement) and a
   // multiple of the kernel block, so each callback is an exact number of blocks.
   const BUFFER = 1024;
-  let node = null, gain = null;
+  let node = null, gain = null, raf = 0;
+  // Playhead anchor: (audio time, LFO phase, rate) captured each callback so the
+  // rAF loop can extrapolate the *audible* phase against the hardware audio clock.
+  let anchorTime = null, anchorPhase = 0, anchorRate = 0;
+
+  // Audible LFO phase now, in [0,1): linearly extrapolate from the last anchor.
+  // anchorTime is the (future) time this buffer becomes audible, so just after a
+  // callback (now < anchorTime) the phase reads slightly behind the buffer start.
+  function currentPhase() {
+    if (anchorTime == null) return null;
+    const p = anchorPhase + (ctx.currentTime - anchorTime) * anchorRate;
+    return p - Math.floor(p);
+  }
 
   function start() {
     // Warm up the persistent LMS weights before any audio is audible, so the
@@ -280,17 +303,32 @@ function createSynth(kernel, { blockSamples, master, warmupBlocks = 0 }) {
       for (let i = 0; i < warmupBlocks; ++i) kernel.render(scratch);
     }
     node = ctx.createScriptProcessor(BUFFER, 0, 1);
-    node.onaudioprocess = (e) => kernel.render(e.outputBuffer.getChannelData(0));
+    node.onaudioprocess = (e) => {
+      const startPhase = kernel.getPhase();          // phase at the first sample of this buffer
+      kernel.render(e.outputBuffer.getChannelData(0));
+      // Anchor to the audio clock: this buffer becomes audible ~outputLatency
+      // after the callback fires. Rate = cycles/sample × samples/sec = cycles/sec.
+      anchorPhase = startPhase;
+      anchorTime  = ctx.currentTime + (ctx.outputLatency || ctx.baseLatency || 0);
+      anchorRate  = kernel.getRate() * ctx.sampleRate;
+    };
     gain = ctx.createGain();
     const now = ctx.currentTime;
     gain.gain.setValueAtTime(0, now);
     gain.gain.linearRampToValueAtTime(master, now + 0.03); // click-free fade-in
     node.connect(gain).connect(ctx.destination);
+    if (onTick) {
+      const frame = () => { onTick(currentPhase()); raf = requestAnimationFrame(frame); };
+      raf = requestAnimationFrame(frame);
+    }
   }
   function stop() {
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
     if (node) { node.disconnect(); node.onaudioprocess = null; }
     if (gain) gain.disconnect();
     node = gain = null;
+    anchorTime = null;
+    onTick?.(null);                                  // clear the playhead
   }
   return { start, stop, get playing() { return !!node; } };
 }
@@ -346,7 +384,8 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
   const g = canvas.getContext('2d');
   let userPoints = new Array(length).fill(null);
   let fullCurve  = new Array(length).fill(0.5);
-  let tool = 'draw', drawing = false, mode = 'linear', hoverIdx = -1;
+  let tool = 'draw', drawing = false, mode = 'linear', hoverIdx = -1, playhead = null;
+  let visible = true;
 
   const interp = (y1, y2, mu) => {
     if (mode === 'cosine') { const m = (1 - Math.cos(mu * Math.PI)) / 2; return y1 * (1 - m) + y2 * m; }
@@ -379,6 +418,7 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
   }
 
   function render() {
+    if (!visible) return;                  // skip all canvas work while hidden
     g.clearRect(0, 0, canvas.width, canvas.height);
     g.strokeStyle = '#21262d'; g.lineWidth = 1;
     for (let i = 1; i < 4; i++) {
@@ -404,6 +444,12 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
       g.beginPath(); g.arc(x, y, 4, 0, 2 * Math.PI);
       g.fillStyle = '#f85149'; g.fill();
       g.strokeStyle = '#fff'; g.lineWidth = 1; g.stroke();
+    }
+    // Playback cursor: the audible LFO position within the cycle (phase 0..1).
+    if (playhead != null) {
+      const px = playhead * canvas.width;
+      g.beginPath(); g.strokeStyle = '#d29922'; g.lineWidth = 1.5;
+      g.moveTo(px, 0); g.lineTo(px, canvas.height); g.stroke();
     }
   }
 
@@ -452,16 +498,20 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
   for (const b of Object.values(buttons)) b.disabled = false;
   interpSelect.disabled = false;
   loadTriangle();
-  return { getCurve: () => [...fullCurve] };
+  // Move the playback cursor (phase in [0,1), or null to hide) and redraw. When
+  // hidden this is a cheap no-op (render() early-returns), so the per-frame draw
+  // overhead disappears while the audio keeps streaming.
+  const setPlayhead = (phase) => { playhead = phase; render(); };
+  // Gate the canvas redraws (the DOM show/hide is handled by the caller). When
+  // false, render() is a no-op so the per-frame draw overhead disappears.
+  const setVisible = (v) => { visible = v; if (v) render(); };
+  return { getCurve: () => [...fullCurve], setPlayhead, setVisible };
 }
 
 // ---- LMS adaptive noise canceller kernel ----------------------------------
 {
   const BLOCK = 128, SR = 44100;               // kernel emits 128 samples per @run call
   const kernel = createKernel({ url: 'lms-noise.linked.wasm', blockSamples: BLOCK });
-  // Peaks reach ~3.7 (brown, wet=0) → generous headroom; warm-up blocks let the
-  // persistent LMS weights adapt before the first audible sample.
-  const synth = createSynth(kernel, { blockSamples: BLOCK, master: 0.25, warmupBlocks: 64 });
 
   const kind = document.getElementById('kind');
   const wet  = document.getElementById('wet');
@@ -471,7 +521,7 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
 
   // LFO shape editor: pushes its 128-slot [0,1] curve into the kernel live; the
   // kernel maps it to the cutoff range and streams it as mode-B breakpoints.
-  createCurveEditor({
+  const editor = createCurveEditor({
     canvas: document.getElementById('curve'),
     output: document.getElementById('curveOut'),
     length: BLOCK,
@@ -485,6 +535,23 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
     interpSelect: document.getElementById('curveInterp'),
     onChange: (c) => kernel.setCurve(c),
   });
+
+  // "LFO shape" collapses the editor to drop the per-frame canvas redraw overhead
+  // (audio keeps playing; the drawn shape and playback tracking are unaffected,
+  // just unseen). Active = expanded, matching the tool buttons' selected style.
+  const curveWrap = document.getElementById('curveWrap');
+  const curveToggle = document.getElementById('curveToggle');
+  curveToggle.addEventListener('click', () => {
+    const collapsed = curveWrap.classList.toggle('collapsed');
+    curveToggle.classList.toggle('active', !collapsed);
+    editor.setVisible(!collapsed);
+  });
+
+  // Peaks reach ~3.7 (brown, wet=0) → generous headroom; warm-up blocks let the
+  // persistent LMS weights adapt before the first audible sample. onTick drives
+  // the editor's playback cursor from the audio-clock-anchored LFO phase.
+  const synth = createSynth(kernel, { blockSamples: BLOCK, master: 0.25, warmupBlocks: 64,
+    onTick: (phase) => editor.setPlayhead(phase) });
 
   // @mu (LMS step size) is left at its compiled default (1e-3, from lms-noise.mlir):
   // small enough that the weights converge over the first few blocks and stay put.
