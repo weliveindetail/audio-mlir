@@ -346,7 +346,7 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
   const g = canvas.getContext('2d');
   let userPoints = new Array(length).fill(null);
   let fullCurve  = new Array(length).fill(0.5);
-  let tool = 'draw', drawing = false, mode = 'linear';
+  let tool = 'draw', drawing = false, mode = 'linear', hoverIdx = -1;
 
   const interp = (y1, y2, mu) => {
     if (mode === 'cosine') { const m = (1 - Math.cos(mu * Math.PI)) / 2; return y1 * (1 - m) + y2 * m; }
@@ -386,6 +386,12 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
       g.beginPath(); g.moveTo(0, y); g.lineTo(canvas.width, y); g.stroke();
     }
     const stepX = canvas.width / (length - 1);
+    // Thin vertical guide on the slot under the cursor, to make it easy to aim.
+    if (hoverIdx >= 0) {
+      const hx = hoverIdx * stepX;
+      g.beginPath(); g.strokeStyle = '#8b949e'; g.lineWidth = 1;
+      g.moveTo(hx, 0); g.lineTo(hx, canvas.height); g.stroke();
+    }
     g.beginPath(); g.strokeStyle = '#2ea043'; g.lineWidth = 2;
     for (let i = 0; i < length; i++) {
       const x = i * stepX, y = canvas.height - fullCurve[i] * canvas.height;
@@ -401,12 +407,17 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
     }
   }
 
-  function interact(e) {
+  const slotAt = (e) => {
     const rect = canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const idx = Math.round(x / (canvas.width / (length - 1)));
+    return Math.max(0, Math.min(length - 1, idx));
+  };
+
+  function interact(e) {
+    const rect = canvas.getBoundingClientRect();
     const y = (e.clientY - rect.top) * (canvas.height / rect.height);
-    let idx = Math.round(x / (canvas.width / (length - 1)));
-    idx = Math.max(0, Math.min(length - 1, idx));
+    const idx = slotAt(e);
     const val = Math.max(0, Math.min(1, 1 - y / canvas.height));
     if (tool === 'draw') userPoints[idx] = val;
     else if (idx !== 0 && idx !== length - 1) userPoints[idx] = null;  // keep anchors
@@ -420,7 +431,11 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
     userPoints[(3 * length) >> 2] = 0; userPoints[length - 1] = 0.5; process(); };
 
   canvas.addEventListener('mousedown', (e) => { drawing = true; interact(e); });
-  canvas.addEventListener('mousemove', (e) => { if (drawing) interact(e); });
+  canvas.addEventListener('mousemove', (e) => {
+    hoverIdx = slotAt(e);
+    if (drawing) interact(e); else render();   // interact() re-renders; else just refresh the guide
+  });
+  canvas.addEventListener('mouseleave', () => { hoverIdx = -1; render(); });
   window.addEventListener('mouseup', () => { drawing = false; });
 
   const setTool = (t) => { tool = t;
