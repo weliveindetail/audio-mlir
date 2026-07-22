@@ -5,7 +5,8 @@
 //
 //   x[n]  = noise color chosen at run time (white/pink/brown/ou, or none=silence)
 //   n0[n] = 0.7 x[n] + 0.5 x[n-1] + 0.3 x[n-2]   (an "acoustic path", via delay)
-//   saw   = 2*frac(440*t) - 1                     (harmonically rich tone)
+//   saw   = sum of MIDI-triggered sawtooth voices (0 during rests; voice bank
+//                                                  in @run, not a fixed 440 Hz)
 //   tone  = lowPass(saw, alpha(t))               (swept 1st-order IIR, automated)
 //   d[n]  = tone[n] + n0[n]                       (tone buried in noise)
 //   y     = LMS(x -> d), a 32-tap adaptive FIR   (dsp.lmsFilterResponse)
@@ -16,6 +17,19 @@
 // harmonics -- the classic, clearly audible filter sweep. The tone survives the
 // adaptive canceller (it is uncorrelated with the noise reference x), so what you
 // hear after cancellation is the swept-filtered sawtooth.
+//
+// WHAT THE DEMO ACTUALLY SHOWS (read before judging the canceller). The goal is
+// pulling the noise OUT OF (tone + noise) -- the hard, realistic case -- NOT out
+// of silence. While a note sounds, d = tone + n0: the LMS nulls the correlated
+// n0, but the tone leaks into its gradient (w += mu*e*x, and the error e still
+// carries the tone), so a small noise residual always survives -- measured about
+// -25 dB below the tone at mu=1e-3. THAT residual is the real ANC behaviour and
+// is the interesting part; it is exactly the "signal leaks into the adaptive
+// filter" effect, and it scales with mu. Because the tone is now MIDI-GATED, a
+// REST has d = n0 (pure noise): a 32-tap filter models the exact 3-tap FIR path
+// perfectly and nulls it to ~machine zero -- dead silence. That "perfect"
+// cancellation during rests is the TRIVIAL case (nothing but the reference to
+// cancel), not a success metric. Always evaluate the canceller with a note held.
 //
 // dsp.index_switch mirrors scf.index_switch's syntax -- an index selector,
 // integer `case` regions, a mandatory `default`, regions yielding a common
@@ -51,13 +65,35 @@ module {
   // dsp.index_switch selector; v1 assumes exactly this shape (a plain load of
   // a named global), mid-term an arbitrary SSA selector.
   memref.global "public" @noise_kind : memref<i64> = dense<0>
-  // Running sample index for the tone's time base. The kernel reads it, offsets t
-  // by offset*dt, and stores offset+N back each call, so the sine phase is
-  // continuous across blocks with no host involvement ("implicit" state). Store 0
-  // to restart the tone from phase 0. It grows unbounded (i64); at f64 precision
-  // the sin argument stays accurate for many hours, so no wrap is needed (it could
-  // be wrapped mod 44100, one exact tone period, for indefinite exactness).
-  memref.global "public" @sample_offset : memref<i64> = dense<0>
+  // --- polyphonic MIDI voice bank (fixed V = 8) -----------------------------
+  // A fixed number of voices, on purpose: a compile-time voice count keeps the
+  // block-render loop's trip count a literal (0..8) and every buffer statically
+  // shaped, so the kernel stays malloc-free and the static-optimisation
+  // properties in notes.md hold. The bank REPLACES the old continuously-running
+  // 440 Hz @sample_offset tone: nothing sounds until a MIDI note triggers a
+  // voice. Each voice keeps its own persistent state across blocks (one slot per
+  // voice in these arrays), the same "implicit state" idea @sample_offset used:
+  //   @voice_freq  : current oscillator frequency (Hz), held while the note sounds
+  //   @voice_phase : sawtooth phase accumulator in [0,1), continuous across blocks
+  //   @voice_gate  : one-pole-SMOOTHED amplitude in [0,1] (click-free attack/rel.)
+  //   @voice_tgt   : the gate's step TARGET (0 = released, 1 = held) it chases
+  memref.global "public" @voice_freq  : memref<8xf64> = dense<0.000000e+00>
+  memref.global "public" @voice_phase : memref<8xf64> = dense<0.000000e+00>
+  memref.global "public" @voice_gate  : memref<8xf64> = dense<0.000000e+00>
+  memref.global "public" @voice_tgt   : memref<8xf64> = dense<0.000000e+00>
+  // Pending MIDI event per voice -- the (value, frame) timestamped-setter record,
+  // exactly like @lfo_period_pending/@lfo_period_frame but one per voice. The host
+  // stages a note on/off through @note_event; @run consumes it, applies the gate
+  // step at frame `ev_frame` (0..N; N=128 means "no pending event") and, for a
+  // note-on, retunes to `ev_freq`. So an event at any sample inside the 128-frame
+  // block is rendered at that exact frame -- the prefilled-vector idea from the
+  // LFO, realised per voice.
+  memref.global "public" @voice_ev_frame : memref<8xi64> = dense<128>
+  memref.global "public" @voice_ev_gate  : memref<8xf64> = dense<0.000000e+00>
+  memref.global "public" @voice_ev_freq  : memref<8xf64> = dense<0.000000e+00>
+  // Per-block scratch the voice loop sums into, then bridges to tensor land via
+  // dsp.fromGlobal (no to_tensor hook in this toolchain). Private.
+  memref.global "private" @voice_mix : memref<128xf64> = dense<0.000000e+00>
   // Low-pass cutoff-LFO period in samples (interactive): the automation speed.
   // A smaller period = faster sweep (LFO Hz = 44100 / period; default 147000 ≈
   // 0.3 Hz). This is now the *held/current* value of the parameter: the host no
@@ -182,33 +218,103 @@ module {
     %n01 = "dsp.add"(%p0, %p1) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
     %n0  = "dsp.add"(%n01, %p2) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
 
-    // --- 440 Hz sawtooth tone: 2*frac(440*t) - 1, continuous across blocks ---
-    // Phase continuity: instead of restarting t at 0 each call, resume the time
-    // base from the persistent @sample_offset counter, so t[n] = (offset+n)*dt.
-    // Read offset, build t from offset*dt, then store offset+N back -- the host
-    // never touches it ("implicit" global state). A sawtooth (harmonically rich),
-    // not a sine, so the swept low-pass below has partials to carve. Naive
-    // (aliasing) saw -- fine for a demo; frac(x) = x mod 1 via dsp.modulo by 1.
-    %dt     = dsp.constant dense<2.2675736961451248E-5> : tensor<f64>  // 1/44100
-    %offmem = memref.get_global @sample_offset : memref<i64>
-    %offval = memref.load %offmem[] : memref<i64>
-    %offf   = arith.sitofp %offval : i64 to f64
-    %dtf    = arith.constant 2.2675736961451248E-5 : f64               // 1/44100
-    %t0f    = arith.mulf %offf, %dtf : f64                             // offset*dt
-    %tstart = tensor.from_elements %t0f : tensor<f64>
-    %t      = "dsp.getRangeOfVector"(%tstart, %cnt, %dt) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    // advance the counter by one block (N) for the next call
-    %blk    = arith.constant 128 : i64
-    %offnew = arith.addi %offval, %blk : i64
-    memref.store %offnew, %offmem[] : memref<i64>
-    %f440  = dsp.constant dense<4.400000e+02> : tensor<f64>            // 440 Hz
-    %f440v = "dsp.getRangeOfVector"(%f440, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    %cyc   = "dsp.mul"(%t, %f440v) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>  // cycles = 440*t
+    // %ones (a constant-1 vector) is used by the LFO section further down; the
+    // tone that used to be here is now the polyphonic voice bank below.
     %one1  = dsp.constant dense<1.000000e+00> : tensor<f64>
     %ones  = "dsp.getRangeOfVector"(%one1, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    %frac  = "dsp.modulo"(%cyc, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>  // frac(440*t) in [0,1)
-    %saw2  = "dsp.add"(%frac, %frac) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>     // 2*frac
-    %saw   = "dsp.sub"(%saw2, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>     // 2*frac - 1
+
+    // --- polyphonic MIDI-triggered sawtooth voices (replaces the continuous
+    //     440 Hz tone) -------------------------------------------------------
+    // Design in one place: a FIXED bank of 8 voices, each an independent naive
+    // sawtooth. Why the choices below:
+    //  * Fixed count (compile-time 0..8 loop): keeps the block static and
+    //    malloc-free (notes.md). Dynamic polyphony would need a runtime bound.
+    //  * Per-voice state carried across blocks in the @voice_* globals (phase,
+    //    smoothed gate, target, freq) -- one slot per voice, the @sample_offset
+    //    "implicit state" pattern generalised to a bank.
+    //  * Arbitrary trigger frame handled the LFO way: the pending (value, frame)
+    //    event steps the gate TARGET at exactly `ev_frame` inside the block; a
+    //    one-pole smoother chases it, so the note starts/stops sample-accurately
+    //    and click-free without splitting the block.
+    //  * Written as a hand-rolled affine loop nest (voice-outer, sample-inner)
+    //    summed into @voice_mix and bridged to tensor land by dsp.fromGlobal --
+    //    the same escape hatch the LFO breakpoint interpolator uses (a per-voice
+    //    phase/gate recurrence is a scan, not expressible as pure tensor ops).
+    //    Trade-off: this bank is opaque to the tensor-level fusion/Axis-B
+    //    rewrites; the alternatives (unrolled tensor lanes, or voices as inlined
+    //    dsp.func calls) are noted in samples/notes.md for later discussion.
+    %vgain = arith.constant 2.000000e-01 : f64            // per-voice gain: 8*0.2 headroom
+    %kc    = arith.constant 1.000000e-02 : f64            // gate smoother rate (~2 ms t.c.)
+    %vdt   = arith.constant 2.2675736961451248E-5 : f64   // 1/44100
+    %vone  = arith.constant 1.000000e+00 : f64
+    %vtwo  = arith.constant 2.000000e+00 : f64
+    %vzero = arith.constant 0.000000e+00 : f64
+    %vhalf = arith.constant 5.000000e-01 : f64
+    %vN    = arith.constant 128 : i64
+    %vfM   = memref.get_global @voice_freq     : memref<8xf64>
+    %vpM   = memref.get_global @voice_phase    : memref<8xf64>
+    %vgM   = memref.get_global @voice_gate     : memref<8xf64>
+    %vtM   = memref.get_global @voice_tgt      : memref<8xf64>
+    %efM   = memref.get_global @voice_ev_frame : memref<8xi64>
+    %egM   = memref.get_global @voice_ev_gate  : memref<8xf64>
+    %erM   = memref.get_global @voice_ev_freq  : memref<8xf64>
+    %mixM  = memref.get_global @voice_mix      : memref<128xf64>
+    // clear the mix accumulator for this block
+    affine.for %z = 0 to 128 {
+      memref.store %vzero, %mixM[%z] : memref<128xf64>
+    }
+    // sum the 8 voices into @voice_mix
+    affine.for %v = 0 to 8 {
+      %freq0 = memref.load %vfM[%v] : memref<8xf64>
+      %ph0   = memref.load %vpM[%v] : memref<8xf64>
+      %g0    = memref.load %vgM[%v] : memref<8xf64>
+      %tgt0  = memref.load %vtM[%v] : memref<8xf64>
+      %efrI  = memref.load %efM[%v] : memref<8xi64>
+      %eg    = memref.load %egM[%v] : memref<8xf64>
+      %ef    = memref.load %erM[%v] : memref<8xf64>
+      %efrF  = arith.sitofp %efrI : i64 to f64
+      // event present this block? note-on == event whose gate target > 0.5
+      %hasEv = arith.cmpi slt, %efrI, %vN : i64
+      %egOn  = arith.cmpf ogt, %eg, %vhalf : f64
+      %isOn  = arith.andi %hasEv, %egOn : i1
+      // note-on retunes the voice and restarts its phase; else hold current
+      %freqE = arith.select %isOn, %ef, %freq0 : f64
+      %phSt  = arith.select %isOn, %vzero, %ph0 : f64
+      %inc   = arith.mulf %freqE, %vdt : f64
+      %res:2 = affine.for %sn = 0 to 128 iter_args(%gp = %g0, %pp = %phSt) -> (f64, f64) {
+        %ni  = arith.index_cast %sn : index to i64
+        %nf  = arith.sitofp %ni : i64 to f64
+        // gate target: old target before the event frame, new target from it on
+        %pre = arith.cmpf olt, %nf, %efrF : f64
+        %tgt = arith.select %pre, %tgt0, %eg : f64
+        // one-pole gate smoother: g += kc*(target - g)
+        %gd  = arith.subf %tgt, %gp : f64
+        %gst = arith.mulf %kc, %gd : f64
+        %gn  = arith.addf %gp, %gst : f64
+        // advance + wrap phase, build 2*frac(phase)-1 sawtooth
+        %pr  = arith.addf %pp, %inc : f64
+        %pge = arith.cmpf oge, %pr, %vone : f64
+        %ps  = arith.subf %pr, %vone : f64
+        %pw  = arith.select %pge, %ps, %pr : f64
+        %s2  = arith.mulf %vtwo, %pw : f64
+        %saw = arith.subf %s2, %vone : f64
+        // mix += saw * gate * per-voice gain
+        %sg  = arith.mulf %saw, %gn : f64
+        %sgv = arith.mulf %sg, %vgain : f64
+        %cur = memref.load %mixM[%sn] : memref<128xf64>
+        %acc = arith.addf %cur, %sgv : f64
+        memref.store %acc, %mixM[%sn] : memref<128xf64>
+        affine.yield %gn, %pw : f64, f64
+      }
+      // persist per-voice state; commit the pending target; consume the event
+      memref.store %res#0, %vgM[%v] : memref<8xf64>
+      memref.store %res#1, %vpM[%v] : memref<8xf64>
+      memref.store %freqE, %vfM[%v] : memref<8xf64>
+      %tgtN = arith.select %hasEv, %eg, %tgt0 : f64
+      memref.store %tgtN, %vtM[%v] : memref<8xf64>
+      memref.store %vN, %efM[%v] : memref<8xi64>
+    }
+    %saw = "dsp.fromGlobal"() {global = @voice_mix} : () -> tensor<128xf64>
 
     // --- automated low-pass on the tone: cutoff swept by a slow in-kernel LFO ---
     // The cutoff coefficient alpha is now materialised PER SAMPLE as a
@@ -378,6 +484,30 @@ module {
     %wy     = "dsp.gain"(%y, %wet) : (tensor<128xf64>, tensor<f64>) -> tensor<128xf64>
     %outt   = "dsp.sub"(%d, %wy) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
     dsp.return %outt : tensor<128xf64>
+  }
+
+  // MIDI voice event setter (out-of-band ABI, exported as
+  // _mlir_ciface_set_note_event). The host does voice ALLOCATION (assign a note
+  // to one of the 8 voices, steal on overflow) and then schedules the resulting
+  // gate change here as a (voice, freq, gate, frame) tuple:
+  //   note-on  -> note_event(v, freqHz, 1.0, frame)
+  //   note-off -> note_event(v, 0.0,    0.0, frame)
+  // It records the event into the voice's pending slots; @run's voice loop above
+  // applies it at `frame` and consumes it. `frame` is 0..N (N=128 == "no event").
+  // Limitation (v1): one pending event per voice per block -- the host allocator
+  // must not target the same voice twice in one block (it allocates a different
+  // free voice instead), and must call this only from the render thread so the
+  // write and @run's consume of the pending slots stay sequential (no race), the
+  // same discipline the LFO breakpoint setter uses.
+  dsp.func @set_note_event(%voice: i64, %freq: f64, %gate: f64, %frame: i64) attributes {llvm.emit_c_interface} {
+    %vi  = arith.index_cast %voice : i64 to index
+    %frm = memref.get_global @voice_ev_frame : memref<8xi64>
+    memref.store %frame, %frm[%vi] : memref<8xi64>
+    %gm  = memref.get_global @voice_ev_gate : memref<8xf64>
+    memref.store %gate, %gm[%vi] : memref<8xf64>
+    %fm  = memref.get_global @voice_ev_freq : memref<8xf64>
+    memref.store %freq, %fm[%vi] : memref<8xf64>
+    dsp.return
   }
 
   // Timestamped parameter setter (out-of-band ABI, exported as

@@ -8,7 +8,10 @@
 #include <thread>
 #include <unistd.h>
 #include <termios.h>
+#include <cmath>
 #include <AudioToolbox/AudioToolbox.h>
+#include <CoreMIDI/CoreMIDI.h>
+#include <CoreAudio/HostTime.h>
 
 // Interactive CoreAudio host for the runtime-color-selectable LMS adaptive
 // noise canceller (lms-noise.mlir), which uses dsp.index_switch on
@@ -80,6 +83,167 @@ static double  gHostPhase = 0.0;                // host LFO phase accumulator, [
 // this mode exists to exercise. The kernel linearly interpolates between them.
 constexpr int LFO_BP_STRIDE = 8;
 
+//===----------------------------------------------------------------------===//
+// MIDI voices: OS MIDI events -> host voice allocation -> kernel (voice, frame)
+//===----------------------------------------------------------------------===//
+// The kernel exposes a fixed bank of NUM_VOICES sawtooth voices (see the
+// @voice_* globals in lms-noise.mlir). A note is dispatched to it out-of-band
+// through @set_note_event(voice, freqHz, gate, frame): the (value, frame) pair
+// the notes.md "timestamped setter" direction calls for. The kernel steps that
+// voice's gate at `frame` inside the next 128-sample block and one-pole-smooths
+// it, so an event at an arbitrary instant is rendered click-free.
+//
+// Split of responsibilities:
+//   * CoreMIDI thread  -> only parses note on/off and enqueues them (lock-free).
+//   * render thread    -> drains the queue, does VOICE ALLOCATION (which note
+//                         maps to which of the 8 hardware voices, stealing the
+//                         oldest on overflow -- inherently sequential bookkeeping,
+//                         a natural host job), and calls the kernel setter. Doing
+//                         allocation + setter only on the render thread keeps the
+//                         writes strictly ordered w.r.t. @run's consume, exactly
+//                         like the LFO breakpoint setter (no cross-thread race).
+constexpr int NUM_VOICES = 8;            // MUST match the kernel's memref<8x...>
+extern "C" void _mlir_ciface_set_note_event(int64_t voice, double freq,
+                                            double gate, int64_t frame);
+
+// Lock-free SPSC queue of raw MIDI note events (CoreMIDI thread -> render thread).
+struct MidiEvent {
+    bool     on;       // true = note-on (vel>0), false = note-off
+    uint8_t  note;     // MIDI note number 0..127
+    uint64_t tNanos;   // event host time in nanoseconds (for frame placement)
+};
+constexpr size_t MIDI_Q_CAP = 1u << 10; // 1024 events
+constexpr size_t MIDI_Q_MASK = MIDI_Q_CAP - 1;
+static MidiEvent gMidiQ[MIDI_Q_CAP];
+static std::atomic<size_t> gMidiHead{0}; // producer (CoreMIDI)
+static std::atomic<size_t> gMidiTail{0}; // consumer (render thread)
+
+// Host-side voice table (owned by the render thread).
+struct HostVoice { int note; bool active; uint64_t order; };
+static HostVoice gHostVoices[NUM_VOICES] = {};
+static uint64_t gVoiceOrder = 1;         // monotonic "age" for oldest-voice steal
+static std::atomic<int> gActiveVoices{0}; // for the status line only
+
+static const double NS_PER_SAMPLE = 1e9 / SAMPLE_RATE;
+
+// MIDI note number -> frequency in Hz (A4 = note 69 = 440 Hz).
+static double noteToHz(int note) {
+    return 440.0 * std::pow(2.0, (note - 69) / 12.0);
+}
+
+// CoreMIDI read callback. Runs on a CoreMIDI thread; do the minimum: parse
+// note-on/off out of each packet and enqueue. No allocation, no kernel calls.
+static void midiReadProc(const MIDIPacketList *pktlist, void *, void *) {
+    const MIDIPacket *pkt = &pktlist->packet[0];
+    for (UInt32 p = 0; p < pktlist->numPackets; ++p) {
+        uint64_t tNanos = pkt->timeStamp ? AudioConvertHostTimeToNanos(pkt->timeStamp)
+                                         : AudioConvertHostTimeToNanos(AudioGetCurrentHostTime());
+        // Walk the (possibly multi-message) packet in 3-byte channel-voice chunks.
+        for (UInt16 i = 0; i + 2 < pkt->length + 1 && i + 2 < pkt->length; i += 3) {
+            uint8_t status = pkt->data[i] & 0xF0;
+            uint8_t note   = pkt->data[i + 1] & 0x7F;
+            uint8_t vel    = pkt->data[i + 2] & 0x7F;
+            bool on;
+            if (status == 0x90 && vel > 0)      on = true;
+            else if (status == 0x80 || (status == 0x90 && vel == 0)) on = false;
+            else continue; // ignore CC / pitchbend / aftertouch for this prototype
+            size_t head = gMidiHead.load(std::memory_order_relaxed);
+            size_t tail = gMidiTail.load(std::memory_order_acquire);
+            if (head - tail < MIDI_Q_CAP) {     // drop on overflow rather than block
+                gMidiQ[head & MIDI_Q_MASK] = MidiEvent{on, note, tNanos};
+                gMidiHead.store(head + 1, std::memory_order_release);
+            }
+        }
+        pkt = MIDIPacketNext(pkt);
+    }
+}
+
+// --- computer-keyboard "emulated MIDI" (used when no real MIDI source) --------
+// When setupMidi() finds no device we turn the computer keyboard into a one-octave
+// piano. Terminal input gives no key-UP events, so the key acts as a TOGGLE: the
+// first press enqueues a note-ON, the next press on the same key enqueues a
+// note-OFF. The keyboard thread is still the sole producer on the SPSC queue.
+// The OS auto-repeats a held key, which would flip the toggle rapidly, so we
+// debounce: same-key presses within KBD_DEBOUNCE_NANOS of the last are ignored.
+static bool gKbdPiano = false;
+static bool gKbdNoteOn[128] = {};           // toggle state per note (input-thread owned)
+static uint64_t gKbdLastPress[128] = {};    // last accepted press, ns (input-thread owned)
+constexpr uint64_t KBD_DEBOUNCE_NANOS = 200'000'000ull; // ignore auto-repeat within 200 ms
+
+// Home-row piano: a=C4(60) w s e d f t g y h u j k = up to C5(72).
+static int keyToNote(char c) {
+    switch (c) {
+        case 'a': return 60; case 'w': return 61; case 's': return 62;
+        case 'e': return 63; case 'd': return 64; case 'f': return 65;
+        case 't': return 66; case 'g': return 67; case 'y': return 68;
+        case 'h': return 69; case 'u': return 70; case 'j': return 71;
+        case 'k': return 72;
+        default:  return -1;
+    }
+}
+
+// Release every voice currently playing `note` (render thread only).
+static void releaseNote(int note, int64_t frame) {
+    for (int i = 0; i < NUM_VOICES; ++i) {
+        if (gHostVoices[i].active && gHostVoices[i].note == note) {
+            gHostVoices[i].active = false;
+            gActiveVoices.fetch_sub(1, std::memory_order_relaxed);
+            _mlir_ciface_set_note_event(i, 0.0, 0.0, frame);
+        }
+    }
+}
+
+// Drain queued MIDI events, allocate voices, and dispatch (voice, freq, gate,
+// frame) to the kernel. Called on the render thread right before rendering a
+// block. `blockStartNanos` timestamps sample 0 of the block being rendered, used
+// to place each event at its frame within [0,128).
+static void drainMidiEvents(uint64_t blockStartNanos) {
+    size_t tail = gMidiTail.load(std::memory_order_relaxed);
+    size_t head = gMidiHead.load(std::memory_order_acquire);
+    for (; tail != head; ++tail) {
+        MidiEvent ev = gMidiQ[tail & MIDI_Q_MASK];
+        int64_t frame = 0;
+        if (ev.tNanos > blockStartNanos) {
+            double f = (ev.tNanos - blockStartNanos) / NS_PER_SAMPLE;
+            frame = f < 0 ? 0 : (f > 127 ? 127 : static_cast<int64_t>(f));
+        }
+        if (ev.on) {
+            // Find a free voice, else steal the oldest active one.
+            int v = -1;
+            for (int i = 0; i < NUM_VOICES; ++i)
+                if (!gHostVoices[i].active) { v = i; break; }
+            if (v < 0) {
+                v = 0;
+                for (int i = 1; i < NUM_VOICES; ++i)
+                    if (gHostVoices[i].order < gHostVoices[v].order) v = i;
+            } else {
+                gActiveVoices.fetch_add(1, std::memory_order_relaxed);
+            }
+            gHostVoices[v] = HostVoice{ev.note, true, gVoiceOrder++};
+            _mlir_ciface_set_note_event(v, noteToHz(ev.note), 1.0, frame);
+        } else {
+            releaseNote(ev.note, frame);
+        }
+    }
+    gMidiTail.store(tail, std::memory_order_release);
+}
+
+// Create a CoreMIDI client + input port and connect every MIDI source the OS
+// currently sees (hardware keyboards, IAC virtual buses, etc.). Returns false if
+// CoreMIDI is unavailable; the demo still runs (just silent until a note plays).
+static bool setupMidi() {
+    MIDIClientRef client = 0;
+    if (MIDIClientCreate(CFSTR("lms-noise"), nullptr, nullptr, &client) != noErr)
+        return false;
+    MIDIPortRef inPort = 0;
+    if (MIDIInputPortCreate(client, CFSTR("in"), midiReadProc, nullptr, &inPort) != noErr)
+        return false;
+    ItemCount nSrc = MIDIGetNumberOfSources();
+    for (ItemCount i = 0; i < nSrc; ++i)
+        MIDIPortConnectSource(inPort, MIDIGetSource(i), nullptr);
+    return nSrc > 0;
+}
+
 // Automation-speed bounds (samples at 44100): ~10 Hz (fast) to ~0.05 Hz (~20 s).
 constexpr int64_t LFO_PERIOD_MIN = 4410;   // 44100 / 10  -> 10 Hz
 constexpr int64_t LFO_PERIOD_MAX = 882000; // 44100 * 20  -> 0.05 Hz
@@ -135,6 +299,10 @@ static void renderLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
+        // Drain MIDI first: allocate voices and stage this block's note events
+        // (voice, freq, gate, frame) into the kernel, timestamped against now.
+        uint64_t nowNanos = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime());
+        drainMidiEvents(nowNanos);
         emitLfoBlock();  // Mode B: stream this block's LFO shape as breakpoints
         fillBlock(scratch);
         for (size_t i = 0; i < BLOCK_SAMPLES; ++i)
@@ -217,10 +385,26 @@ static void emitLfoBlock() {
     gHostPhase -= std::floor(gHostPhase); // keep in [0,1)
 }
 
-// Reprint the single status line (wet %, noise color, and sweep speed).
+// Compact status readout: captions on one line, values redrawn on the line below
+// (so it fits narrow terminals and stays easy to refresh -- captions are static
+// and printed once by printCaptions(); printStatus() only rewrites the value row).
+// Both rows share the same column widths so cells line up.
+#define STATUS_FMT "%-8s| %-7s| %-9s| %-7s| %-6s"
+
+static void printCaptions() {
+    printf(STATUS_FMT "\n", "Reduce", "Color", "Sweep", "LFO", "Voices");
+    fflush(stdout);
+}
+
 static void printStatus() {
-    printf("\rNoise reduction: %3.0f%%   |   Noise color: %-6s |   Sweep: %5.2f Hz   |   LFO: %-6s ",
-           wet * 100.0, currentKindName(), lfoHz(), lfo_mode ? "HOST" : "KERNEL");
+    char reduce[16], color[16], sweep[16], lfo[16], voices[16];
+    snprintf(reduce, sizeof reduce, "%.0f%%", wet * 100.0);
+    snprintf(color,  sizeof color,  "%s", currentKindName());
+    snprintf(sweep,  sizeof sweep,  "%.2f Hz", lfoHz());
+    snprintf(lfo,    sizeof lfo,    "%s", lfo_mode ? "HOST" : "KERNEL");
+    snprintf(voices, sizeof voices, "%d/%d",
+             gActiveVoices.load(std::memory_order_relaxed), NUM_VOICES);
+    printf("\r" STATUS_FMT, reduce, color, sweep, lfo, voices);
     fflush(stdout);
 }
 
@@ -353,6 +537,12 @@ int main() {
     wet = 1.0;
     noise_kind = 0; // start on white
 
+    // Connect to the OS MIDI graph. The kernel's tone bank is silent until a
+    // note-on arrives, so play a MIDI keyboard (or route an IAC/virtual source).
+    // With no device, fall back to the computer keyboard as a one-octave piano.
+    bool midiOk = setupMidi();
+    gKbdPiano = !midiOk;
+
     // Prime the ring with a few blocks so the very first callbacks never
     // underrun before the render thread has spun up.
     for (int i = 0; i < 4; ++i) {
@@ -374,9 +564,15 @@ int main() {
     std::cout << "\n==============================================" << std::endl;
     std::cout << "   CoreAudio LMS Adaptive Noise Canceller Running!" << std::endl;
     std::cout << "==============================================" << std::endl;
-    std::cout << " -> A 440 Hz tone corrupted by interference; the LMS filter" << std::endl;
-    std::cout << "    estimates the interference and the knobs sweep how much" << std::endl;
-    std::cout << "    of it to remove and which color of noise to fight." << std::endl;
+    std::cout << " -> Play a MIDI keyboard: each note triggers a polyphonic (max "
+              << NUM_VOICES << ")" << std::endl;
+    std::cout << "    sawtooth voice, buried in noise; the LMS filter estimates the" << std::endl;
+    std::cout << "    interference and the knobs sweep how much of it to remove." << std::endl;
+    std::cout << (midiOk ? " -> MIDI: connected to OS source(s)."
+                         : " -> MIDI: no source found -- computer keyboard emulates one.")
+              << std::endl;
+    if (gKbdPiano)
+        std::cout << " -> [A W S E D F T G Y H U J K] one-octave piano (C4..C5) -- press to start, press again to stop" << std::endl;
     std::cout << " -> [UP/DOWN]     more / less cancellation (toward a clean tone)" << std::endl;
     std::cout << " -> [LEFT/RIGHT]  cycle noise color (white/pink/brown/ou/none)" << std::endl;
     std::cout << " -> [+ / -]       cutoff-sweep speed (faster / slower)" << std::endl;
@@ -385,6 +581,7 @@ int main() {
     std::cout << "==============================================\n" << std::endl;
 
     enableRawMode();
+    printCaptions();
     printStatus();
 
     char c;
@@ -408,6 +605,29 @@ int main() {
             lfo_mode = gLfoMode;
             printStatus();
             continue;
+        }
+        // Computer-keyboard piano (only when no real MIDI device): a note key
+        // TOGGLES its voice -- first press enqueues a note-ON, next press a
+        // note-OFF. A per-key debounce drops the OS auto-repeat of a held key so
+        // it doesn't flip the toggle. This is the sole producer on the MIDI queue.
+        if (gKbdPiano) {
+            int note = keyToNote(c);
+            if (note >= 0) {
+                uint64_t t = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime());
+                if (t - gKbdLastPress[note] >= KBD_DEBOUNCE_NANOS) {
+                    gKbdLastPress[note] = t;
+                    bool on = !gKbdNoteOn[note];
+                    gKbdNoteOn[note] = on;
+                    size_t head = gMidiHead.load(std::memory_order_relaxed);
+                    size_t tail = gMidiTail.load(std::memory_order_acquire);
+                    if (head - tail < MIDI_Q_CAP) {
+                        gMidiQ[head & MIDI_Q_MASK] =
+                            MidiEvent{on, static_cast<uint8_t>(note), t};
+                        gMidiHead.store(head + 1, std::memory_order_release);
+                    }
+                }
+                continue;
+            }
         }
         // Arrow keys send: '\x1b', '[', then 'A' Up / 'B' Down / 'C' Right / 'D' Left.
         if (c == '\x1b') {

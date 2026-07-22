@@ -47,6 +47,27 @@
                       background:#090a0f; color:#3fb950; border:1px solid #21262d;
                       border-radius:7px; font-family:inherit; font-size:.7rem; padding:.5rem;
                       resize:none; }
+  .piano { margin:1rem 0 .25rem; }
+  .piano-tools { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; margin-bottom:.6rem; }
+  .piano-tools button { padding:.4rem .8rem; font-size:.8rem; }
+  .piano-tools button.active { background:#238636; border-color:#2ea043; color:#fff; }
+  .piano-hint { font-size:.75rem; color:#8b949e; }
+  .piano.collapsed #pianoPanel { display:none; }   /* only the "Piano" button remains */
+  .pkeys { position:relative; height:150px; user-select:none; display:flex;
+           border:1px solid #21262d; border-radius:7px; overflow:hidden; background:#090a0f; }
+  .wkey { position:relative; flex:1 1 0; border-right:1px solid #21262d;
+          background:linear-gradient(#f4f6fb,#d7dde5); border-radius:0 0 5px 5px;
+          display:flex; align-items:flex-end; justify-content:center;
+          padding-bottom:.5rem; cursor:pointer; }
+  .wkey:last-child { border-right:none; }
+  .wkey .cap { color:#3a3f47; font-size:.75rem; font-weight:600; }
+  .wkey.active { background:linear-gradient(#7ee787,#2ea043); }
+  .bkey { position:absolute; top:0; height:60%; z-index:2; cursor:pointer;
+          background:linear-gradient(#2b3038,#0b0e12); border:1px solid #000;
+          border-radius:0 0 4px 4px; display:flex; align-items:flex-end;
+          justify-content:center; padding-bottom:.35rem; }
+  .bkey .cap { color:#c9d1d9; font-size:.7rem; font-weight:600; }
+  .bkey.active { background:linear-gradient(#2ea043,#176a2e); }
 </style>
 </head>
 <body>
@@ -60,11 +81,13 @@
   <section class="panel" id="lmsPanel">
     <h2>LMS Adaptive Noise Canceller</h2>
     <p class="desc">
-      A swept-low-pass 440&nbsp;Hz sawtooth buried in colored noise; a 32-tap LMS adaptive
-      FIR learns the noise path and subtracts it. <code>@noise_kind</code> picks the color,
-      <code>@wet</code> sweeps how much of the estimate to remove (0 = noisy, 1 = tone revealed),
-      and the host streams a user-drawn cutoff-sweep LFO shape as per-block breakpoints
-      (<code>@lfo_mode</code> = 1); Sweep stretches/compresses that shape over time.
+      A swept-low-pass sawtooth — now MIDI-triggered from the on-screen piano — buried in
+      colored noise; a 32-tap LMS adaptive FIR learns the noise path and subtracts it.
+      <code>@noise_kind</code> picks the color, <code>@wet</code> sweeps how much of the
+      estimate to remove (0 = noisy, 1 = tone revealed), and the host streams a user-drawn
+      cutoff-sweep LFO shape as per-block breakpoints (<code>@lfo_mode</code> = 1); Sweep
+      stretches/compresses that shape over time. Play a note to hear the canceller pull the
+      noise out of the tone (a rest cancels pure noise — the trivial case).
     </p>
     <div class="row">
       <button id="lmsStart" class="primary">▶ Start audio</button>
@@ -110,6 +133,16 @@
         <p class="curve-hint">Draw the LFO cutoff-sweep shape (one cycle over 128 slots):
           click/drag to place points, Erase to remove them; gaps are interpolated.</p>
         <textarea id="curveOut" readonly></textarea>
+      </div>
+    </div>
+    <div class="piano" id="pianoWrap">
+      <div class="piano-tools">
+        <button id="pianoToggle" class="active">Piano</button>
+        <span class="piano-hint">Click a key — or press its letter — to start/stop a note
+          (toggle). One octave C4..C5.</span>
+      </div>
+      <div id="pianoPanel">
+        <div class="pkeys" id="pkeys"></div>
       </div>
     </div>
     <div class="status" id="lmsStatus">Ready</div>
@@ -216,6 +249,48 @@ function createKernel({ url, blockSamples }) {
   // Live curve update from the editor (array of CURVE_LEN values in [0,1]).
   const setCurve = (arr) => { curve = arr; };
 
+  // --- polyphonic MIDI voices (browser piano) -------------------------------
+  // Mirror of the native host's voice allocator: the UI toggles notes, we assign
+  // each note-ON a kernel voice slot (stealing the oldest when all NUM_VOICES are
+  // busy) and dispatch (voice, freq, gate, frame) via _mlir_ciface_set_note_event.
+  // @run renders the voice bank from those globals and self-clears the event slot
+  // after consuming it. Events are queued from the UI thread and drained at the top
+  // of each render() callback with frame 0 (sub-buffer timing is inaudible here).
+  const NUM_VOICES = 8;
+  const voices = Array.from({ length: NUM_VOICES }, () => ({ note: -1, active: false, order: 0 }));
+  let voiceOrder = 0;
+  const noteQ = [];
+  const noteToHz = (n) => 440 * Math.pow(2, (n - 69) / 12);
+  const queueNote = (on, note) => { noteQ.push({ on, note }); };
+  function drainNotes() {
+    if (!exports) return;
+    while (noteQ.length) {
+      const { on, note } = noteQ.shift();
+      if (on) {
+        let v = voices.findIndex(x => !x.active);
+        if (v < 0) { v = 0; for (let i = 1; i < NUM_VOICES; i++) if (voices[i].order < voices[v].order) v = i; }
+        voices[v] = { note, active: true, order: voiceOrder++ };
+        exports._mlir_ciface_set_note_event(BigInt(v), noteToHz(note), 1.0, 0n);
+      } else {
+        for (let i = 0; i < NUM_VOICES; i++)
+          if (voices[i].active && voices[i].note === note) {
+            voices[i].active = false;
+            exports._mlir_ciface_set_note_event(BigInt(i), 0.0, 0.0, 0n);
+          }
+      }
+    }
+  }
+  // Silence every voice (on Stop): flush the queue and gate off any still-active slot.
+  function allNotesOff() {
+    noteQ.length = 0;
+    if (!exports) return;
+    for (let i = 0; i < NUM_VOICES; i++)
+      if (voices[i].active) {
+        voices[i].active = false;
+        exports._mlir_ciface_set_note_event(BigInt(i), 0.0, 0.0, 0n);
+      }
+  }
+
   // Sample the user curve at a fractional phase (0..1 == one cycle) and map its
   // [0,1] value onto the cutoff-coefficient range. Linearly interpolates between
   // curve slots and wraps, so any lfoPeriod (faster/slower than one block) works.
@@ -244,12 +319,13 @@ function createKernel({ url, blockSamples }) {
   // Stream `outFloat32.length` samples by invoking the kernel one block at a
   // time — the browser analogue of the native host's fillBlock() render loop.
   // The kernel writes exactly blockSamples per @run call and advances its own
-  // --stream state (@sample_offset, LMS weights, noise/filter accumulators), so
+  // --stream state (voice phases/gates, LMS weights, noise/filter accumulators), so
   // consecutive calls form one continuous, seam-free stream. Each block first
   // gets its host-side LFO breakpoints streamed in. The output length must be a
   // multiple of blockSamples (the audio callback uses a buffer size that is).
   function render(outFloat32) {
     const base = OUT_PTR / 8;
+    drainNotes();                              // apply queued piano note on/offs
     for (let n = 0; n < outFloat32.length; n += blockSamples) {
       bump = ARENA_BASE;                       // fresh arena per block
       emitLfoBlock();                          // host streams this block's LFO shape
@@ -260,6 +336,7 @@ function createKernel({ url, blockSamples }) {
   }
 
   return { load, setParam, setParamI64, setLfoPeriod, setCurve, render,
+    queueNote, allNotesOff,             // piano note on/off dispatch to the voice bank
     getPhase: () => hostPhase,          // generation phase within the LFO cycle [0,1)
     getRate:  () => 1 / lfoPeriod,      // cycles advanced per sample
     get loaded() { return !!exports; } };
@@ -268,10 +345,10 @@ function createKernel({ url, blockSamples }) {
 // ---------------------------------------------------------------------------
 // Continuous streaming player: the browser analogue of the native host's render
 // thread + ring buffer. A ScriptProcessorNode pulls fresh audio from the kernel
-// every callback, one block at a time, so the --stream state (tone phase, LFO
+// every callback, one block at a time, so the --stream state (voice phases, LFO
 // phase, LMS weights, noise/filter accumulators) advances continuously and the
 // output never loops. This removes the old "loop a 1-second buffer" seam — the
-// cutoff-sweep LFO and 440 Hz tone are now truly continuous, and parameter
+// cutoff-sweep LFO and the MIDI-triggered voices are truly continuous, and parameter
 // globals are picked up live on the next block (no regenerate/crossfade needed).
 // ---------------------------------------------------------------------------
 let ctx = null;
@@ -569,6 +646,83 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
       { el: sweep, apply: () => { const hz = +sweep.value; sweepVal.textContent = `${hz.toFixed(2)} Hz`;
         kernel.setLfoPeriod(Math.round(SR / hz)); } },
     ],
+  });
+
+  // --- on-screen piano (MIDI-triggered voices) ------------------------------
+  // One octave C4..C5. Each key carries its computer-key letter as a caption and
+  // maps to the same letters as the native driver's emulated keyboard. A key
+  // TOGGLES its note (press = ON, press again = OFF); clicking or pressing the
+  // letter both route through toggleNote(). The lit key reflects the note state.
+  const PIANO_KEYS = [
+    { note: 60, key: 'a', black: false }, { note: 61, key: 'w', black: true  },
+    { note: 62, key: 's', black: false }, { note: 63, key: 'e', black: true  },
+    { note: 64, key: 'd', black: false }, { note: 65, key: 'f', black: false },
+    { note: 66, key: 't', black: true  }, { note: 67, key: 'g', black: false },
+    { note: 68, key: 'y', black: true  }, { note: 69, key: 'h', black: false },
+    { note: 70, key: 'u', black: true  }, { note: 71, key: 'j', black: false },
+    { note: 72, key: 'k', black: false },
+  ];
+  const WHITE_TOTAL = PIANO_KEYS.filter(k => !k.black).length;  // 8 white keys
+  const keyEls = {};                       // note -> key element (for the lit highlight)
+  const keyByLetter = {};                  // computer-key letter -> note
+  const noteState = new Set();             // notes currently toggled on (UI source of truth)
+  const pkeys = document.getElementById('pkeys');
+  {
+    // White keys flow left-to-right; each black key is absolutely positioned,
+    // centered on the boundary after the white keys placed before it.
+    let whiteIdx = 0;
+    for (const k of PIANO_KEYS) {
+      const el = document.createElement('div');
+      el.className = k.black ? 'bkey' : 'wkey';
+      el.innerHTML = `<span class="cap">${k.key.toUpperCase()}</span>`;
+      if (k.black) {
+        const w = (100 / WHITE_TOTAL) * 0.64;
+        el.style.width = w + '%';
+        el.style.left  = (whiteIdx * (100 / WHITE_TOTAL) - w / 2) + '%';
+      } else whiteIdx++;
+      el.addEventListener('mousedown', (e) => { e.preventDefault(); toggleNote(k.note); });
+      keyEls[k.note] = el;
+      keyByLetter[k.key] = k.note;
+      pkeys.appendChild(el);
+    }
+  }
+
+  // Toggle a note ON/OFF. Only while audio runs, since the voices are only audible
+  // then (matching the LFO editor's "prepare before Start" doesn't apply to sound).
+  function toggleNote(note) {
+    if (!synth.playing) return;
+    const on = !noteState.has(note);
+    if (on) noteState.add(note); else noteState.delete(note);
+    keyEls[note].classList.toggle('active', on);
+    kernel.queueNote(on, note);
+  }
+  // Reset the piano (called on Stop): clear the lit keys and silence the voices.
+  function clearPiano() {
+    noteState.clear();
+    for (const n in keyEls) keyEls[n].classList.remove('active');
+    kernel.allNotesOff();
+  }
+  document.getElementById('lmsStop').addEventListener('click', clearPiano);
+
+  // Computer keyboard drives the piano too. e.repeat filters the OS auto-repeat of
+  // a held key so it doesn't flip the toggle (the native driver uses a 200 ms
+  // debounce for the same reason). Ignore keystrokes aimed at form controls.
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+    const note = keyByLetter[e.key.toLowerCase()];
+    if (note === undefined) return;
+    e.preventDefault();
+    toggleNote(note);
+  });
+
+  // "Piano" show/hide, mirroring the "LFO shape" toggle (active = shown).
+  const pianoWrap = document.getElementById('pianoWrap');
+  const pianoToggle = document.getElementById('pianoToggle');
+  pianoToggle.addEventListener('click', () => {
+    const collapsed = pianoWrap.classList.toggle('collapsed');
+    pianoToggle.classList.toggle('active', !collapsed);
   });
 }
 </script>

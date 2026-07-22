@@ -26,6 +26,6 @@ dsp1 "$KERNEL" --stream --emit=llvm $OPT_FLAG -o "$STEM-native.ll"
 llc "$STEM-native.ll" -filetype=obj -o "$STEM-native.o"
 
 # Link with the dedicated CoreAudio host (Up/Down = wet, Left/Right = noise color).
-clang++ -O3 lms-noise-macOS.cpp "$STEM-native.o" -framework AudioToolbox -framework CoreAudio -o "$STEM-macOS"
+clang++ -O3 lms-noise-macOS.cpp "$STEM-native.o" -framework AudioToolbox -framework CoreAudio -framework CoreMIDI -framework CoreFoundation -o "$STEM-macOS"
 
 echo "Built $STEM-macOS -- run it to hear the demo."

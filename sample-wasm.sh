@@ -17,6 +17,7 @@ wasm-ld --no-entry --import-memory --allow-undefined \
         --export=run --export=_mlir_ciface_run \
         --export=wet --export=noise_kind --export=lfo_mode \
         --export=_mlir_ciface_set_value_lfo_breakpoint \
+        --export=_mlir_ciface_set_note_event \
         --export=__wasm_call_ctors --export=__heap_base --export=__data_end \
         out/lms-noise.wasm -o sample-wasm/lms-noise.linked.wasm
 

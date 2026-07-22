@@ -134,6 +134,64 @@ still does **not**:
   to recompute per call, but swapping them instantaneously causes a small discontinuity; a
   crossfade between old/new coefficient sets is not implemented (acceptable for the demo).
 
+## Polyphonic MIDI voices (WIP prototype -- under review)
+
+`lms-noise.mlir` runs a **fixed bank of V=8 MIDI-triggered voices** whose summed output
+feeds the swept low-pass -> LMS chain. `@run`'s signature is unchanged
+(`run(%out: memref<128xf64>)`), so every existing host/build path still links; the change
+is additive globals + one new setter. The macOS host (`lms-noise-macOS.cpp`) opens
+CoreMIDI, and the render thread does voice allocation and dispatches events to the kernel.
+Verified: silent until note-on, one-pole-smoothed attack, chords sum, release to silence,
+sample-accurate frame gating -- all malloc-free (default `AssertNoHeapAllocPass` passes).
+
+**How the open design questions were answered in this prototype:**
+
+- **Arbitrary trigger instant inside a fixed 128-sample block.** Reuse the LFO's
+  timestamped-`(value, frame)` idea, one record per voice (`@voice_ev_frame/_gate/_freq`).
+  `@run` steps the voice's gate *target* at exactly `ev_frame` and a one-pole smoother
+  chases it, so a note that starts/stops mid-block is click-free with **no block
+  splitting**. This is the "prefilled vector" reuse -- the per-sample gate is synthesised
+  from the sparse event rather than being handed a dense buffer (cf. Mode B breakpoints,
+  which stream a dense buffer; both are valid, the sparse-event form matches live MIDI).
+- **Fixed vs. dynamic voice count.** Fixed (8), on purpose: a compile-time `0..V` loop
+  keeps the block static and malloc-free (the notes.md optimisation properties). Dynamic
+  polyphony would need a runtime loop bound and lose compile-time trip counts. Host-side
+  voice *stealing* (oldest-first) hides the cap.
+- **Voice state.** Each voice carries phase / smoothed-gate / target / freq in a
+  `memref<8xf64>` slot -- the `@sample_offset` "implicit state" pattern generalised to a
+  bank, persisted across blocks like every other `--stream` global.
+- **Where the DSP/host line is drawn.** Voice *allocation* (note->slot, stealing) is
+  sequential event bookkeeping and lives in the host; the kernel only renders a fixed bank.
+
+**Design options for the voice bank itself (the sub-topic to discuss).** The prototype
+renders the bank as a **hand-written affine loop nest** (voice-outer, sample-inner) summed
+into `@voice_mix` and bridged back with `dsp.fromGlobal` -- the same escape hatch the LFO
+breakpoint interpolator uses. It is the most direct reuse of validated machinery, but it is
+**opaque to tensor-level fusion and the Axis-B rewrites**. Alternatives, ordered by how much
+they preserve the optimiser:
+  1. *Unrolled tensor lanes* -- write each voice as rank-1 `dsp` tensor ops (getRangeOfVector
+     ramp / modulo / mul-gate) and `dsp.add` them. Stays in tensor land (fuses, vectorises),
+     but V-fold source blow-up and the per-voice phase/gate recurrence still needs a scan
+     (phase is closed-form per block, the smoothed gate is not -> would need a gate op).
+  2. *Voices as `dsp.func` + `dsp.generic_call`, inlined.* The toyc pipeline inlines all
+     calls into `@run` before lowering (`createInlinerPass`, then deletes the callee), so a
+     `@voice(...)` helper called V times is **flattened to one scope** -- source clarity with
+     no residual call barrier. After inlining it is identical to (1)/unrolling, so functions
+     here are an organisational choice, not a different optimisation regime. (Exported
+     `@set_*`/`@run` funcs survive; only internally-called helpers are inlined away.)
+  3. *A batched `tensor<VxNxf64>` voice dimension* -- one op over all voices; needs dialect
+     work (rank-2 variants of the oscillator/gate ops) but is the cleanest long-term.
+  4. *A first-class stateful `dsp.osc`/`dsp.voice` scan op* -- folds phase+gate recurrence
+     into one op that `StreamStateMaterialization` gives per-instance state (the "shared
+     scan primitive" direction in the feedforward/feedback section below).
+
+**Prototype limitations (v1).** One pending event per voice per block (the host allocator
+must not target a voice twice in one block); `@set_note_event` must be called only from the
+render thread (same no-race discipline as the LFO breakpoint setter); and with the ring
+buffer between render and playback, live events mostly land at `frame 0` -- the per-sample
+gate ramp is in place and correct, but true sample-accurate live scheduling needs tighter
+audio-clock coupling than the current ring gives.
+
 ## Feedforward tensor ops vs. feedback scan ops (the state model that scales)
 
 The dialect splits cleanly into two categories by whether an op's output feeds back into
