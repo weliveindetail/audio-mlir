@@ -32,6 +32,18 @@
   .status { font-size:.8rem; color:#8b949e; margin-top:1rem; white-space:pre-wrap;
             border-top:1px solid #21262d; padding-top:.9rem; }
   code { color:#79c0ff; }
+  .curve { margin:1rem 0 .25rem; }
+  .curve-tools { display:flex; gap:.4rem; flex-wrap:wrap; margin-bottom:.6rem; }
+  .curve-tools button { padding:.4rem .8rem; font-size:.8rem; }
+  .curve-tools button.active { background:#238636; border-color:#2ea043; color:#fff; }
+  .curve-tools select { flex:0 0 auto; padding:.4rem .6rem; font-size:.8rem; }
+  canvas#curve { background:#090a0f; border:1px solid #21262d; border-radius:7px;
+                 cursor:crosshair; display:block; width:100%; height:auto; }
+  .curve-hint { font-size:.75rem; color:#8b949e; margin:.5rem 0 0; }
+  textarea#curveOut { width:100%; height:52px; margin-top:.5rem; box-sizing:border-box;
+                      background:#090a0f; color:#3fb950; border:1px solid #21262d;
+                      border-radius:7px; font-family:inherit; font-size:.7rem; padding:.5rem;
+                      resize:none; }
 </style>
 </head>
 <body>
@@ -48,8 +60,8 @@
       A swept-low-pass 440&nbsp;Hz sawtooth buried in colored noise; a 32-tap LMS adaptive
       FIR learns the noise path and subtracts it. <code>@noise_kind</code> picks the color,
       <code>@wet</code> sweeps how much of the estimate to remove (0 = noisy, 1 = tone revealed),
-      and the host streams the cutoff-sweep LFO shape as per-block breakpoints
-      (<code>@lfo_mode</code> = 1); Sweep stretches/compresses that shape.
+      and the host streams a user-drawn cutoff-sweep LFO shape as per-block breakpoints
+      (<code>@lfo_mode</code> = 1); Sweep stretches/compresses that shape over time.
     </p>
     <div class="row">
       <button id="lmsStart" class="primary">▶ Start audio</button>
@@ -75,6 +87,23 @@
       <input type="range" id="sweep" min="0.1" max="10" step="0.1" value="3" disabled />
       <span class="val" id="sweepVal">3.00 Hz</span>
     </div>
+    <div class="curve">
+      <div class="curve-tools">
+        <button id="curveDraw" class="active" disabled>Draw</button>
+        <button id="curveErase" disabled>Erase</button>
+        <button id="curveTriangle" disabled>Triangle</button>
+        <button id="curveSine" disabled>Sine</button>
+        <button id="curveClear" disabled>Clear</button>
+        <select id="curveInterp" disabled>
+          <option value="linear">Linear</option>
+          <option value="cosine">Cosine</option>
+        </select>
+      </div>
+      <canvas id="curve" width="640" height="180"></canvas>
+      <p class="curve-hint">Draw the LFO cutoff-sweep shape (one cycle over 128 slots):
+        click/drag to place points, Erase to remove them; gaps are interpolated.</p>
+      <textarea id="curveOut" readonly></textarea>
+    </div>
     <div class="status" id="lmsStatus">Ready</div>
   </section>
 </main>
@@ -98,18 +127,22 @@ const align = (x, a) => (x + (a - 1)) & ~(a - 1);
 // Host-side cutoff LFO ("mode B"): instead of the kernel deriving the sweep from
 // its own phase accumulator (mode A), the host streams the LFO shape as per-block
 // breakpoints and the kernel linearly interpolates between them. This mirrors the
-// native driver's emitLfoBlock(). The shape is a hard-coded triangle for now; the
-// Sweep control only stretches/compresses it via lfoPeriod (samples per cycle).
+// native driver's emitLfoBlock(). The shape is a 128-slot curve the user draws in
+// the editor (values in [0,1]); the Sweep control stretches/compresses it via
+// lfoPeriod (samples per cycle). The kernel maps the [0,1] shape onto the filter
+// coefficient's usable range — a 0..1 triangle reproduces the old hard-coded LFO.
 const LFO_BP_STRIDE = 8;                    // breakpoint every 8 frames + the last
-const lfoShape = (phase) => {               // 0.02 … 0.35 triangle, matches native
-  const frac = phase - Math.floor(phase);
-  return 0.02 + 0.33 * (1 - Math.abs(2 * frac - 1));
-};
+const CURVE_LEN     = 128;                  // one LFO cycle == one editor curve
+const ALPHA_MIN = 0.02, ALPHA_SPAN = 0.33; // curve [0,1] → cutoff coeff [0.02, 0.35]
 
 function createKernel({ url, blockSamples }) {
   let memory, f64, u8, dv, exports = null;
   let bump = 0, OUT_PTR = 0, DESC_PTR = 0, ARENA_BASE = 0;
   let hostPhase = 0, lfoPeriod = 147000;     // ~0.3 Hz at 44.1 kHz until Sweep sets it
+  // The LFO shape as one cycle of CURVE_LEN values in [0,1]; defaults to a
+  // triangle (matching the old hard-coded shape) until the editor pushes one.
+  let curve = Array.from({ length: CURVE_LEN }, (_, i) =>
+    1 - Math.abs(2 * (i / (CURVE_LEN - 1)) - 1));
 
   const refreshViews = () => {
     f64 = new Float64Array(memory.buffer);
@@ -172,18 +205,30 @@ function createKernel({ url, blockSamples }) {
 
   // Sweep control → host LFO cycle length in samples (LFO Hz = SR / lfoPeriod).
   const setLfoPeriod = (samples) => { lfoPeriod = samples; };
+  // Live curve update from the editor (array of CURVE_LEN values in [0,1]).
+  const setCurve = (arr) => { curve = arr; };
 
-  // Stream one block of triangle-LFO breakpoints into the kernel's @lfo_bp slots
-  // (via _mlir_ciface_set_value_lfo_breakpoint(value, frame)), then advance the
-  // host phase by one block. The kernel interpolates between the breakpoints and
-  // clears each slot to its -1.0 sentinel as it consumes it. Frame is an i64, so
-  // it must be passed as a BigInt. Mirrors the native host's emitLfoBlock().
+  // Sample the user curve at a fractional phase (0..1 == one cycle) and map its
+  // [0,1] value onto the cutoff-coefficient range. Linearly interpolates between
+  // curve slots and wraps, so any lfoPeriod (faster/slower than one block) works.
+  function sampleCurve(phase) {
+    const pos = (phase - Math.floor(phase)) * CURVE_LEN;
+    const i0 = Math.floor(pos), t = pos - i0;
+    const a = curve[i0 % CURVE_LEN], b = curve[(i0 + 1) % CURVE_LEN];
+    return ALPHA_MIN + ALPHA_SPAN * (a * (1 - t) + b * t);
+  }
+
+  // Stream one block of LFO breakpoints into the kernel's @lfo_bp slots (via
+  // _mlir_ciface_set_value_lfo_breakpoint(value, frame)), then advance the host
+  // phase by one block. The kernel interpolates between the breakpoints and clears
+  // each slot to its -1.0 sentinel as it consumes it. Frame is an i64, so it must
+  // be passed as a BigInt. Mirrors the native host's emitLfoBlock().
   function emitLfoBlock() {
     const inc = 1 / lfoPeriod;
     for (let f = 0; f < blockSamples; f += LFO_BP_STRIDE)
-      exports._mlir_ciface_set_value_lfo_breakpoint(lfoShape(hostPhase + f * inc), BigInt(f));
+      exports._mlir_ciface_set_value_lfo_breakpoint(sampleCurve(hostPhase + f * inc), BigInt(f));
     exports._mlir_ciface_set_value_lfo_breakpoint(
-      lfoShape(hostPhase + (blockSamples - 1) * inc), BigInt(blockSamples - 1));
+      sampleCurve(hostPhase + (blockSamples - 1) * inc), BigInt(blockSamples - 1));
     hostPhase += blockSamples * inc;
     hostPhase -= Math.floor(hostPhase);
   }
@@ -206,7 +251,7 @@ function createKernel({ url, blockSamples }) {
     }
   }
 
-  return { load, setParam, setParamI64, setLfoPeriod, render, get loaded() { return !!exports; } };
+  return { load, setParam, setParamI64, setLfoPeriod, setCurve, render, get loaded() { return !!exports; } };
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +335,111 @@ function wirePanel({ kernel, synth, startBtn, stopBtn, statusEl, controls }) {
     c.el.addEventListener('input', () => c.apply());
 }
 
+// ---------------------------------------------------------------------------
+// 128-slot LFO shape editor. `userPoints[i]` is an assigned value in [0,1] or
+// null (unassigned); process() interpolates the gaps (linear/cosine) into the
+// full curve and calls onChange with it. The endpoints are always anchored so
+// the cycle is well-defined. getCurve() exposes the current full curve as a
+// plain array. Adapted from the standalone ctrl.html playground.
+// ---------------------------------------------------------------------------
+function createCurveEditor({ canvas, output, length, buttons, interpSelect, onChange }) {
+  const g = canvas.getContext('2d');
+  let userPoints = new Array(length).fill(null);
+  let fullCurve  = new Array(length).fill(0.5);
+  let tool = 'draw', drawing = false, mode = 'linear';
+
+  const interp = (y1, y2, mu) => {
+    if (mode === 'cosine') { const m = (1 - Math.cos(mu * Math.PI)) / 2; return y1 * (1 - m) + y2 * m; }
+    return y1 * (1 - mu) + y2 * mu;
+  };
+
+  function process() {
+    // Anchor endpoints so every gap has a defined start/end to interpolate.
+    if (userPoints[0] === null) {
+      const first = userPoints.find(v => v !== null);
+      userPoints[0] = first !== undefined ? first : 0.5;
+    }
+    if (userPoints[length - 1] === null) {
+      let last = 0.5;
+      for (let i = length - 1; i >= 0; i--) if (userPoints[i] !== null) { last = userPoints[i]; break; }
+      userPoints[length - 1] = last;
+    }
+    let lastIdx = 0;
+    fullCurve = [...userPoints];
+    for (let i = 1; i < length; i++) {
+      if (userPoints[i] !== null) {
+        const s = userPoints[lastIdx], e = userPoints[i], steps = i - lastIdx;
+        for (let j = lastIdx; j <= i; j++) fullCurve[j] = interp(s, e, (j - lastIdx) / steps);
+        lastIdx = i;
+      }
+    }
+    if (output) output.value = JSON.stringify(fullCurve.map(v => +v.toFixed(3)));
+    render();
+    onChange?.(fullCurve);
+  }
+
+  function render() {
+    g.clearRect(0, 0, canvas.width, canvas.height);
+    g.strokeStyle = '#21262d'; g.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const y = (canvas.height / 4) * i;
+      g.beginPath(); g.moveTo(0, y); g.lineTo(canvas.width, y); g.stroke();
+    }
+    const stepX = canvas.width / (length - 1);
+    g.beginPath(); g.strokeStyle = '#2ea043'; g.lineWidth = 2;
+    for (let i = 0; i < length; i++) {
+      const x = i * stepX, y = canvas.height - fullCurve[i] * canvas.height;
+      i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+    }
+    g.stroke();
+    for (let i = 0; i < length; i++) {
+      if (userPoints[i] === null) continue;
+      const x = i * stepX, y = canvas.height - userPoints[i] * canvas.height;
+      g.beginPath(); g.arc(x, y, 4, 0, 2 * Math.PI);
+      g.fillStyle = '#f85149'; g.fill();
+      g.strokeStyle = '#fff'; g.lineWidth = 1; g.stroke();
+    }
+  }
+
+  function interact(e) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+    let idx = Math.round(x / (canvas.width / (length - 1)));
+    idx = Math.max(0, Math.min(length - 1, idx));
+    const val = Math.max(0, Math.min(1, 1 - y / canvas.height));
+    if (tool === 'draw') userPoints[idx] = val;
+    else if (idx !== 0 && idx !== length - 1) userPoints[idx] = null;  // keep anchors
+    process();
+  }
+
+  const loadTriangle = () => { userPoints.fill(null); userPoints[0] = 0;
+    userPoints[length >> 1] = 1; userPoints[length - 1] = 0; process(); };
+  const loadSine = () => { userPoints.fill(null); userPoints[0] = 0.5;
+    userPoints[length >> 2] = 1; userPoints[length >> 1] = 0.5;
+    userPoints[(3 * length) >> 2] = 0; userPoints[length - 1] = 0.5; process(); };
+
+  canvas.addEventListener('mousedown', (e) => { drawing = true; interact(e); });
+  canvas.addEventListener('mousemove', (e) => { if (drawing) interact(e); });
+  window.addEventListener('mouseup', () => { drawing = false; });
+
+  const setTool = (t) => { tool = t;
+    buttons.draw.classList.toggle('active', t === 'draw');
+    buttons.erase.classList.toggle('active', t === 'erase'); };
+  buttons.draw.addEventListener('click', () => setTool('draw'));
+  buttons.erase.addEventListener('click', () => setTool('erase'));
+  buttons.triangle.addEventListener('click', loadTriangle);
+  buttons.sine.addEventListener('click', loadSine);
+  buttons.clear.addEventListener('click', () => { userPoints.fill(null); process(); });
+  interpSelect.addEventListener('change', (e) => { mode = e.target.value; process(); });
+
+  // Editable without audio running, so the shape can be prepared before Start.
+  for (const b of Object.values(buttons)) b.disabled = false;
+  interpSelect.disabled = false;
+  loadTriangle();
+  return { getCurve: () => [...fullCurve] };
+}
+
 // ---- LMS adaptive noise canceller kernel ----------------------------------
 {
   const BLOCK = 128, SR = 44100;               // kernel emits 128 samples per @run call
@@ -303,6 +453,24 @@ function wirePanel({ kernel, synth, startBtn, stopBtn, statusEl, controls }) {
   const wetVal = document.getElementById('wetVal');
   const sweep    = document.getElementById('sweep');
   const sweepVal = document.getElementById('sweepVal');
+
+  // LFO shape editor: pushes its 128-slot [0,1] curve into the kernel live; the
+  // kernel maps it to the cutoff range and streams it as mode-B breakpoints.
+  createCurveEditor({
+    canvas: document.getElementById('curve'),
+    output: document.getElementById('curveOut'),
+    length: BLOCK,
+    buttons: {
+      draw:     document.getElementById('curveDraw'),
+      erase:    document.getElementById('curveErase'),
+      triangle: document.getElementById('curveTriangle'),
+      sine:     document.getElementById('curveSine'),
+      clear:    document.getElementById('curveClear'),
+    },
+    interpSelect: document.getElementById('curveInterp'),
+    onChange: (c) => kernel.setCurve(c),
+  });
+
   // @mu (LMS step size) is left at its compiled default (1e-3, from lms-noise.mlir):
   // small enough that the weights converge over the first few blocks and stay put.
   wirePanel({
