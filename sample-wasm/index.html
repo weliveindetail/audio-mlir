@@ -48,7 +48,8 @@
       A swept-low-pass 440&nbsp;Hz sawtooth buried in colored noise; a 32-tap LMS adaptive
       FIR learns the noise path and subtracts it. <code>@noise_kind</code> picks the color,
       <code>@wet</code> sweeps how much of the estimate to remove (0 = noisy, 1 = tone revealed),
-      and <code>@lfo_period</code> sets the in-kernel cutoff-sweep speed.
+      and the host streams the cutoff-sweep LFO shape as per-block breakpoints
+      (<code>@lfo_mode</code> = 1); Sweep stretches/compresses that shape.
     </p>
     <div class="row">
       <button id="lmsStart" class="primary">▶ Start audio</button>
@@ -72,7 +73,7 @@
     <div class="row">
       <label for="sweep">Sweep</label>
       <input type="range" id="sweep" min="0.1" max="10" step="0.1" value="3" disabled />
-      <span class="val" id="sweepVal">0.30 Hz</span>
+      <span class="val" id="sweepVal">3.00 Hz</span>
     </div>
     <div class="status" id="lmsStatus">Ready</div>
   </section>
@@ -94,9 +95,21 @@ const PAGE = 65536;
 const INITIAL_PAGES = 512;   // 32 MiB — one run's scratch fits with room to spare
 const align = (x, a) => (x + (a - 1)) & ~(a - 1);
 
+// Host-side cutoff LFO ("mode B"): instead of the kernel deriving the sweep from
+// its own phase accumulator (mode A), the host streams the LFO shape as per-block
+// breakpoints and the kernel linearly interpolates between them. This mirrors the
+// native driver's emitLfoBlock(). The shape is a hard-coded triangle for now; the
+// Sweep control only stretches/compresses it via lfoPeriod (samples per cycle).
+const LFO_BP_STRIDE = 8;                    // breakpoint every 8 frames + the last
+const lfoShape = (phase) => {               // 0.02 … 0.35 triangle, matches native
+  const frac = phase - Math.floor(phase);
+  return 0.02 + 0.33 * (1 - Math.abs(2 * frac - 1));
+};
+
 function createKernel({ url, blockSamples }) {
   let memory, f64, u8, dv, exports = null;
   let bump = 0, OUT_PTR = 0, DESC_PTR = 0, ARENA_BASE = 0;
+  let hostPhase = 0, lfoPeriod = 147000;     // ~0.3 Hz at 44.1 kHz until Sweep sets it
 
   const refreshViews = () => {
     f64 = new Float64Array(memory.buffer);
@@ -130,6 +143,7 @@ function createKernel({ url, blockSamples }) {
     const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), imports);
     exports = instance.exports;
     exports.__wasm_call_ctors?.();             // run static ctors (initialises data)
+    dv.setBigInt64(exports.lfo_mode.value, 1n, true);  // mode B: host streams the LFO
 
     // One-block output buffer above the kernel heap, then the descriptor, then
     // the per-call bump arena. The kernel writes exactly blockSamples per @run
@@ -156,24 +170,43 @@ function createKernel({ url, blockSamples }) {
   const setParam    = (name, value) => { dv.setFloat64(exports[name].value, value, true); };
   const setParamI64 = (name, value) => { dv.setBigInt64(exports[name].value, BigInt(value), true); };
 
+  // Sweep control → host LFO cycle length in samples (LFO Hz = SR / lfoPeriod).
+  const setLfoPeriod = (samples) => { lfoPeriod = samples; };
+
+  // Stream one block of triangle-LFO breakpoints into the kernel's @lfo_bp slots
+  // (via _mlir_ciface_set_value_lfo_breakpoint(value, frame)), then advance the
+  // host phase by one block. The kernel interpolates between the breakpoints and
+  // clears each slot to its -1.0 sentinel as it consumes it. Frame is an i64, so
+  // it must be passed as a BigInt. Mirrors the native host's emitLfoBlock().
+  function emitLfoBlock() {
+    const inc = 1 / lfoPeriod;
+    for (let f = 0; f < blockSamples; f += LFO_BP_STRIDE)
+      exports._mlir_ciface_set_value_lfo_breakpoint(lfoShape(hostPhase + f * inc), BigInt(f));
+    exports._mlir_ciface_set_value_lfo_breakpoint(
+      lfoShape(hostPhase + (blockSamples - 1) * inc), BigInt(blockSamples - 1));
+    hostPhase += blockSamples * inc;
+    hostPhase -= Math.floor(hostPhase);
+  }
+
   // Stream `outFloat32.length` samples by invoking the kernel one block at a
   // time — the browser analogue of the native host's fillBlock() render loop.
   // The kernel writes exactly blockSamples per @run call and advances its own
-  // --stream state (@sample_offset, LMS weights, noise/filter accumulators, LFO
-  // phase), so consecutive calls form one continuous, seam-free stream. The
-  // output length must be a multiple of blockSamples (the audio callback uses a
-  // buffer size that is).
+  // --stream state (@sample_offset, LMS weights, noise/filter accumulators), so
+  // consecutive calls form one continuous, seam-free stream. Each block first
+  // gets its host-side LFO breakpoints streamed in. The output length must be a
+  // multiple of blockSamples (the audio callback uses a buffer size that is).
   function render(outFloat32) {
     const base = OUT_PTR / 8;
     for (let n = 0; n < outFloat32.length; n += blockSamples) {
       bump = ARENA_BASE;                       // fresh arena per block
+      emitLfoBlock();                          // host streams this block's LFO shape
       exports._mlir_ciface_run(DESC_PTR);      // native ABI: pointer to descriptor
       for (let i = 0; i < blockSamples; ++i)
         outFloat32[n + i] = f64[base + i];     // f64 → f32 on copy
     }
   }
 
-  return { load, setParam, setParamI64, render, get loaded() { return !!exports; } };
+  return { load, setParam, setParamI64, setLfoPeriod, render, get loaded() { return !!exports; } };
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +314,10 @@ function wirePanel({ kernel, synth, startBtn, stopBtn, statusEl, controls }) {
       { el: kind, apply: () => kernel.setParamI64('noise_kind', +kind.value) },
       { el: wet,  apply: () => { const w = +wet.value; wetVal.textContent = w.toFixed(2);
         kernel.setParam('wet', w); } },
-      // @lfo_period is the cutoff-sweep period in samples (i64): LFO Hz = SR / period.
+      // Sweep sets the host LFO cycle length in samples (LFO Hz = SR / period); the
+      // host streams the triangle breakpoints each block (mode B), so no kernel global.
       { el: sweep, apply: () => { const hz = +sweep.value; sweepVal.textContent = `${hz.toFixed(2)} Hz`;
-        kernel.setParamI64('lfo_period', Math.round(SR / hz)); } },
+        kernel.setLfoPeriod(Math.round(SR / hz)); } },
     ],
   });
 }
