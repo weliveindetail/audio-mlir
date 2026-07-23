@@ -527,6 +527,94 @@ data point to capture (`bench-out/03-vectorized.log` or similar).
   feedforward tensor maps; `dsp.scan` is the single feedback primitive. That is exactly the
   state model that scales from the previous section, now made concrete as an op set.
 
+## Target-portable `dsp.scan`: the associative / parallel-scan form
+
+`dsp.scan` is a first-order linear recurrence
+
+```
+y[n] = a[n]*y[n-1] + b[n]*x[n]      (state carried across blocks in y[-1])
+```
+
+The current lowering (`ScanOpLowering`, LowerToAffineLoops.cpp) emits the obvious
+sequential inner loop over N. That is optimal for narrow SIMD and VLIW DSP cores
+(2--8 lanes; the sequential dependency is not the bottleneck when the voice axis V
+already fills the vector unit). It is the *wrong* shape for any target wider than
+the voice count -- AVX-512 with V<=8, GPUs, TPUs, wide HVX -- because there the N
+axis is the serialization and it must be broken.
+
+### Why it parallelizes
+
+Fold the input into the running state: let `c[n] = b[n]*x[n]`. Then each timestep is
+an **affine map** on the carried scalar `y`:
+
+```
+f_n(y) = a[n]*y + c[n]
+```
+
+Composition of two such maps is again affine and is **associative**:
+
+```
+(f_hi . f_lo)(y) = a_hi*(a_lo*y + c_lo) + c_hi
+                 = (a_hi*a_lo)*y + (a_hi*c_lo + c_hi)
+```
+
+So represent each step by the pair `(A, C) = (a[n], c[n])` and define the combine
+
+```
+(A_hi, C_hi) (+) (A_lo, C_lo) = (A_hi*A_lo,  A_hi*C_lo + C_hi)   identity (1, 0)
+```
+
+This is an associative monoid, so an **inclusive prefix scan** over the N pairs
+yields the cumulative `(A_0..n, C_0..n)`, and the output is recovered in one map:
+
+```
+y[n] = A_0..n * y[-1] + C_0..n         (y[-1] = carried block state)
+```
+
+The scan itself costs `log2(N)` parallel steps (N=128 -> 7 steps) instead of N
+sequential ones. Two standard schedules:
+- **Hillis-Steele** (inclusive, `N*log N` work, `log N` depth, no down-sweep):
+  easiest to emit in-register / in-lane for wide SIMD.
+- **Blelloch** (work-efficient, `2N` work, up- + down-sweep): the right choice for
+  GPU/TPU where total work, not depth, is the cost.
+
+### Optimization opportunities this unlocks
+
+- **One rewrite, every feedback op.** Per the "one recurrence to optimize (Axis B1)"
+  note above, every stateful block in the kernel (per-voice low-pass, envelope gate,
+  pink/brown/OU noise, and structurally the LMS adaptive recurrence) is an instance
+  of this scan. Implement the associative form once and all of them retarget.
+- **Wide SIMD (AVX-512).** With V<=8 filling one ZMM on the voice axis, an additional
+  in-lane Hillis-Steele over N lets a wide machine process a *time* block in `log N`
+  vector steps rather than 128 scalar ones -- the escape from N-boundedness.
+- **GPU / TPU.** The Blelloch scan maps the N axis onto many lanes; the reduce and
+  wavetable gather (warp shuffle / texture fetch) already fit. This is the *only*
+  route to occupancy on those targets given V=8 is too small alone.
+- **Time-varying coefficients are free.** `a[n]` and `c[n]` are per-sample already,
+  so the affine-pair formulation needs no constant-coefficient assumption -- the
+  swept one-pole and event-driven gate keep working unchanged.
+
+### Implementation sketch
+
+Key the lowering on a target width (pass option or a `dsp.scan` target attribute);
+`ScanOpLowering` picks a strategy:
+
+1. **`sequential` (default, narrow SIMD / DSP cores).** Today's inner N loop.
+2. **`associative` (wide SIMD / GPU / TPU).** Lower to:
+   - a feedforward map computing `C[n] = b[n]*x[n]` (parallel over N and V),
+   - a prefix scan over pairs `(a[n], C[n])` with the combine above -- Hillis-Steele
+     emitted as `log2(N)` shifted vector passes for SIMD, or delegated to a
+     `scf.parallel` / GPU-dialect Blelloch for accelerators,
+   - a final `y[n] = A_cum[n]*y[-1] + C_cum[n]` map (parallel), where `y[-1]` is the
+     module-scope stream-state global (unchanged plumbing).
+   The carried-state global and the reset-as-coefficient-masking trick both survive:
+   forcing `a[f]=0` at a reset frame zeroes `A_cum` from that frame on, exactly as in
+   the sequential form.
+
+Correctness note: the associative form reassociates the sums, so the checksum moves
+within fp tolerance (an Axis-B numeric rewrite, per the checksum guard below), not
+bit-stable. Guard it with the fp-tolerance band, not bit-equality.
+
 ## Performance Improvements
 
 The reference kernel for this section is `lms-noise.mlir` (the streaming adaptive
@@ -740,3 +828,73 @@ Semantics:
   independently is a cross product of clones; decide whether to nest dispatchers
   (product blow-up) or restrict to one switch per kernel initially and diagnose
   the rest. Document the chosen policy when implemented.
+
+## Target encodings for the voice/scan work
+
+Notes on how the batched voice pipeline (`tensor<8x128xf64>`, V=8 parallel voices,
+N=128 sequential scans) maps onto targets beyond the M1 Pro (NEON, 2-wide f64). 
+
+### Newer Apple arm64 (M4 / A17+): SME / SME2
+
+M2/M3 are still plain NEON (128-bit, `vector<2xf64>`) -- no change from M1. The jump
+is **M4 / A17 Pro and later**, which add **SVE2** and **SME/SME2** (Scalable Matrix
+Extension). SME is *tile*-oriented, not lane-oriented, so it does not accelerate the
+sequential scan directly; its win is the **`dsp.reduce` over V** and the voice
+mix-down, which are outer-product / matmul-shaped.
+
+- **Encoding surface.** Streaming SVE mode entered/exited with `SMSTART` / `SMSTOP`
+  (the `PSTATE.SM` and `PSTATE.ZA` bits); the accumulator lives in the **ZA tile**
+  register. FP64 outer-product accumulate is `FMOPA` (f64 variant, gated on the
+  `FEAT_SME_F64F64` feature); tile row/col moves are `MOVA`; predication uses the SVE
+  governing predicate registers `p0`--`p15`. Streaming vector length `SVL` is
+  implementation-defined (Apple exposes a fixed SVL; query via `RDSVL`).
+- **MLIR path.** The ArmSME dialect lowers to these; route the reduce/mix through
+  Linalg -> Vector -> ArmSME rather than the affine scalar path. This is the same
+  machinery Accelerate/AMX already use under the hood.
+- **Caveat.** Keep the scan on NEON `vector<2xf64>`; only the reduction and any
+  FIR/convolution-shaped tap loop (the LMS 32-tap) are worth moving to SME.
+
+### Hexagon (Qualcomm HVX): fixed-point reformulation
+
+HVX is a **1024-bit** vector unit but **integer / fixed-point** -- its habitat is
+int8/int16/int32 audio, not f64. To exploit it the kernel must move to **Q-format
+fixed point** (Q15 for coefficients/samples, Q31 for accumulators), which is what
+production mobile audio does anyway.
+
+- **Encoding surface.** VLIW packets of up to 4 instructions (`{ ... }`). Vector
+  MAC/multiply: `V6_vmpyhv` / `V6_vmpyiwh` and the `vrmpy` reduce-multiply family
+  (dot products -> maps onto both the FIR taps and the `dsp.reduce`); saturating
+  fixed-point ops carry the Q-format. State/history and the wavetable mod-L wrap map
+  onto **hardware circular addressing** -- the `M0/M1` modifier registers plus the
+  `CS0/CS1` circular-start registers, addressed with `.circ` post-increment modes --
+  which is a near-exact match for `dsp.wrap` and the delay lines. Zero-overhead
+  hardware loops via `loop0/loop1` + `endloop`.
+- **MLIR path.** No upstream Hexagon dialect; lower the fixed-point form to LLVM IR
+  and rely on the Hexagon LLVM backend + HVX intrinsics, or emit intrinsics directly.
+  The scan's `a[n]*y[n-1]` becomes a Q31 saturating MAC.
+- **Cost.** Requires a fixed-point pass (scale analysis / Q-format assignment) ahead
+  of lowering -- a real reformulation, high payoff, but changes the checksum model
+  entirely (fixed-point error, not fp tolerance).
+
+### Dedicated DSP cores (SHARC / TI C6000 / Tensilica HiFi)
+
+The kernel's native habitat: designed for exactly this class of IIR/FIR + wavetable
+audio, favoring f32 (SHARC also 40-bit and native f64) with VLIW ILP across the 8
+independent voice lanes even without wide SIMD.
+
+- **ADI SHARC.** Single-cycle MAC; **zero-overhead loops** (`LCNTR = N, DO end UNTIL
+  LCE`); **circular buffers** via the DAG address-generator register files
+  (`I`ndex / `M`odify / `L`ength / `B`ase) -- set `L` non-zero and the pointer wraps
+  in hardware, matching `dsp.wrap`, the delay lines, and the wavetable read with zero
+  branch overhead. Native 32/40-bit float keeps the scan in floating point (no
+  fixed-point detour).
+- **TI C6000.** 8-way VLIW (two `.M` multiply units etc.); software-pipelined loops
+  the compiler schedules across the parallel voices; `SPLOOP` buffer for tight
+  kernels. f32 throughout.
+- **Cadence Tensilica HiFi.** Configurable SIMD MACs (2/4-way) tuned for audio; codec
+  vendors' default target. Intrinsics-driven, no MLIR dialect.
+- **MLIR path.** None upstream for these; the realistic route is emit portable
+  LLVM IR / C from the affine or scalar form and hand it to the vendor toolchain,
+  keeping the `sequential` scan lowering (their zero-overhead loops + circular
+  addressing make the sequential recurrence cheap -- the associative rewrite is not
+  needed and would only add work).
