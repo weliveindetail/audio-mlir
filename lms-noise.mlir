@@ -130,6 +130,23 @@ module {
   // bridges to tensor land via dsp.fromGlobal and sums across voices with
   // dsp.reduce (no to_tensor hook in this toolchain). Private.
   memref.global "private" @voice_mix : memref<8x128xf64> = dense<0.000000e+00>
+  // Per-voice, per-block DECODE scratch: a small 8-iteration block-level loop
+  // resolves each voice's pending MIDI event into the flat control vectors the
+  // batched tensor voice bank consumes (one slot per voice). @vb_ph_first =
+  // starting saw phase for this block (note-on resets to 0, +inc pre-advance);
+  // @vb_inc = per-sample saw phase increment (freq/44100); @vb_efrF = event
+  // frame as f64 (eventToSignal step edge); @vb_tgt0 = the previously-held gate
+  // target (eventToSignal carry, snapshotted before it is overwritten this
+  // block); @vb_trigfr = the note-on-masked trigger frame (sentinel 128 unless a
+  // real note-on, so eventToTrigger fires the reset pulse only on note-ons);
+  // @vb_step = this voice's latched cutoff-LFO speed (broadcast as the cutoff
+  // scan's per-sample increment). These bridge to tensor land via dsp.fromGlobal.
+  memref.global "private" @vb_ph_first : memref<8xf64> = dense<0.000000e+00>
+  memref.global "private" @vb_inc      : memref<8xf64> = dense<0.000000e+00>
+  memref.global "private" @vb_efrF     : memref<8xf64> = dense<1.280000e+02>
+  memref.global "private" @vb_tgt0     : memref<8xf64> = dense<0.000000e+00>
+  memref.global "private" @vb_trigfr   : memref<8xf64> = dense<1.280000e+02>
+  memref.global "private" @vb_step     : memref<8xf64> = dense<1.000000e+00>
   // Low-pass cutoff-LFO period in samples (interactive): the automation speed.
   // A smaller period = faster sweep (LFO Hz = 44100 / period; default 147000 ≈
   // 0.3 Hz). This is now the *held/current* value of the parameter: the host no
@@ -256,66 +273,61 @@ module {
 
     // --- polyphonic MIDI-triggered sawtooth voices (replaces the continuous
     //     440 Hz tone) -------------------------------------------------------
-    // Design in one place: a FIXED bank of 8 voices, each an independent naive
-    // sawtooth. Why the choices below:
-    //  * Fixed count (compile-time 0..8 loop): keeps the block static and
-    //    malloc-free (notes.md). Dynamic polyphony would need a runtime bound.
-    //  * Per-voice state carried across blocks in the @voice_* globals (phase,
-    //    smoothed gate, target, freq) -- one slot per voice, the @sample_offset
-    //    "implicit state" pattern generalised to a bank.
-    //  * Arbitrary trigger frame handled the LFO way: the pending (value, frame)
-    //    event steps the gate TARGET at exactly `ev_frame` inside the block; a
-    //    one-pole smoother chases it, so the note starts/stops sample-accurately
-    //    and click-free without splitting the block.
-    //  * Written as a hand-rolled affine loop nest (voice-outer, sample-inner)
-    //    summed into @voice_mix and bridged to tensor land by dsp.fromGlobal --
-    //    the same escape hatch the LFO breakpoint interpolator uses (a per-voice
-    //    phase/gate recurrence is a scan, not expressible as pure tensor ops).
-    //    Trade-off: this bank is opaque to the tensor-level fusion/Axis-B
-    //    rewrites; the alternatives (unrolled tensor lanes, or voices as inlined
-    //    dsp.func calls) are noted in samples/notes.md for later discussion.
-    %vgain = arith.constant 2.000000e-01 : f64            // per-voice gain: 8*0.2 headroom
-    %kc    = arith.constant 1.000000e-02 : f64            // gate smoother rate (~2 ms t.c.)
+    // BATCHED tensor voice bank (rank-2 tensor<8x128>): the hand-rolled fused
+    // per-sample voice loop is gone. The four per-voice recurrences now ride the
+    // composable primitives (samples/notes.md "What ops to add"):
+    //   gate target = eventToSignal   (sparse MIDI event -> dense step/hold)
+    //   note-on trg = eventToTrigger  (the sample-tight reset pulse)
+    //   gate        = scan            (one-pole smoother, feedback primitive)
+    //   saw phase   = getRangeOfVector + wrap (per-voice ramp, branchless frac)
+    //   cutoff LFO  = scan (reset via coeff masking) + wavetable (shared shape)
+    //   low-pass    = scan (reset via coeff masking)
+    //   mix         = mul + reduce    (drop the @voice_mix / fromGlobal bridge)
+    // The V (voice) axis is embarrassingly parallel and the whole bank is tensor
+    // -typed end to end, so it fuses with the downstream add/LMS/mix. The three
+    // scans each carry their own --stream state global (gate value, cutoff phase,
+    // low-pass state), replacing the old @voice_gate / @voice_cut_phase /
+    // @voice_lp_state manual carries; the remaining per-voice state (freq, saw
+    // phase, gate target, cutoff speed) is still carried in the @voice_* globals
+    // and resolved by a small 8-iteration block-level DECODE loop below.
+    //
+    // Reset handling (samples/notes.md Q1): neither reset-bearing scan needs a
+    // dedicated reset operand -- forcing the feedback coefficient a[.,f]=0 at the
+    // trigger frame drops the carried state, exactly the old select(atTrg,0,.).
+    // The cutoff phase resets to 0 (a=b=1-trg), the low-pass state resets by
+    // masking its a with (1-trg). The saw phase resets block-level (its pre-
+    // trigger portion is gated to ~0 anyway), so it is a plain per-voice ramp.
     %vdt   = arith.constant 2.2675736961451248E-5 : f64   // 1/44100
-    %vone  = arith.constant 1.000000e+00 : f64
-    %vtwo  = arith.constant 2.000000e+00 : f64
     %vzero = arith.constant 0.000000e+00 : f64
     %vhalf = arith.constant 5.000000e-01 : f64
     %vN    = arith.constant 128 : i64
+    %vNf   = arith.constant 1.280000e+02 : f64
     %vfM   = memref.get_global @voice_freq     : memref<8xf64>
     %vpM   = memref.get_global @voice_phase    : memref<8xf64>
-    %vgM   = memref.get_global @voice_gate     : memref<8xf64>
     %vtM   = memref.get_global @voice_tgt      : memref<8xf64>
     %efM   = memref.get_global @voice_ev_frame : memref<8xi64>
     %egM   = memref.get_global @voice_ev_gate  : memref<8xf64>
     %erM   = memref.get_global @voice_ev_freq  : memref<8xf64>
-    %mixM  = memref.get_global @voice_mix      : memref<8x128xf64>
-    // per-voice cutoff-envelope constants (the LFO is gone; each voice reads its
-    // alpha from the shared @voice_cut_shape table at its own trigger-anchored
-    // phase, so all voices share one shape but keep independent positions).
-    %vL     = arith.constant 8.000000e+03 : f64   // shape-table length; cp wraps here
-    %vcpM   = memref.get_global @voice_cut_phase : memref<8xf64>
-    %vlpM   = memref.get_global @voice_lp_state  : memref<8xf64>
-    %vcsM   = memref.get_global @voice_cut_shape : memref<8000xf64>
-    %vcstM  = memref.get_global @voice_cut_step  : memref<8xf64>
+    %vcstM = memref.get_global @voice_cut_step : memref<8xf64>
+    // block-level DECODE scratch the loop fills (bridged to tensor land below).
+    %sPhF  = memref.get_global @vb_ph_first : memref<8xf64>
+    %sInc  = memref.get_global @vb_inc      : memref<8xf64>
+    %sEfrF = memref.get_global @vb_efrF     : memref<8xf64>
+    %sTgt0 = memref.get_global @vb_tgt0     : memref<8xf64>
+    %sTrig = memref.get_global @vb_trigfr   : memref<8xf64>
+    %sStep = memref.get_global @vb_step     : memref<8xf64>
     // current cutoff-LFO speed for NEW voices, read once per block; only latched
     // into a voice's own @voice_cut_step at its note-on (see the loop below).
     %vstepM = memref.get_global @cut_lfo_step : memref<f64>
     %vstepNew = memref.load %vstepM[] : memref<f64>
-    // Each voice writes its own row of @voice_mix (memref<8x128>); the cross-voice
-    // sum is now a tensor-land dsp.reduce after the loop, not an in-loop add. Every
-    // [v, sn] slot is written exactly once below, so no pre-clear is needed.
-    // Render the 8 voices into @voice_mix, each low-passed by its OWN cutoff envelope
-    // anchored sample-accurately at that voice's trigger frame (option A of the
-    // notes.md voice-bank options: the per-voice one-pole is an extra iter_arg,
-    // the cutoff envelope another per-voice phase carried across blocks).
+    // DECODE: resolve each voice's pending MIDI event into the flat per-voice
+    // control vectors the batched ops consume, and commit the carried state
+    // (freq, saw phase, gate target, cutoff speed; consume the event). The heavy
+    // per-sample work is the batched pipeline afterwards; this loop is 8 iters.
     affine.for %v = 0 to 8 {
       %freq0 = memref.load %vfM[%v] : memref<8xf64>
       %ph0   = memref.load %vpM[%v] : memref<8xf64>
-      %g0    = memref.load %vgM[%v] : memref<8xf64>
       %tgt0  = memref.load %vtM[%v] : memref<8xf64>
-      %cph0  = memref.load %vcpM[%v] : memref<8xf64>
-      %ylp0  = memref.load %vlpM[%v] : memref<8xf64>
       %vst0  = memref.load %vcstM[%v] : memref<8xf64>
       %efrI  = memref.load %efM[%v] : memref<8xi64>
       %eg    = memref.load %egM[%v] : memref<8xf64>
@@ -333,81 +345,80 @@ module {
       // speed it was born with, so a live @cut_lfo_step change affects only new
       // notes. Block-level like %freqE: the gate mutes any pre-trigger portion.
       %stepE = arith.select %isOn, %vstepNew, %vst0 : f64
-      %res:4 = affine.for %sn = 0 to 128
-               iter_args(%gp = %g0, %pp = %phSt, %cp = %cph0, %yp = %ylp0)
-               -> (f64, f64, f64, f64) {
-        %ni  = arith.index_cast %sn : index to i64
-        %nf  = arith.sitofp %ni : i64 to f64
-        // is this the EXACT trigger frame of a note-on? (the sample-tight anchor
-        // for both the cutoff envelope reset and the filter-state reset below)
-        %onFr  = arith.cmpf oeq, %nf, %efrF : f64
-        %atTrg = arith.andi %onFr, %isOn : i1
-        // gate target: old target before the event frame, new target from it on
-        %pre = arith.cmpf olt, %nf, %efrF : f64
-        %tgt = arith.select %pre, %tgt0, %eg : f64
-        // one-pole gate smoother: g += kc*(target - g)
-        %gd  = arith.subf %tgt, %gp : f64
-        %gst = arith.mulf %kc, %gd : f64
-        %gn  = arith.addf %gp, %gst : f64
-        // advance + wrap phase, build 2*frac(phase)-1 sawtooth
-        %pr  = arith.addf %pp, %inc : f64
-        %pge = arith.cmpf oge, %pr, %vone : f64
-        %ps  = arith.subf %pr, %vone : f64
-        %pw  = arith.select %pge, %ps, %pr : f64
-        %s2  = arith.mulf %vtwo, %pw : f64
-        %saw = arith.subf %s2, %vone : f64
-        // per-voice cutoff LFO phase: resets to 0 at the exact trigger frame, then
-        // advances by this voice's latched speed (%stepE) each sample and WRAPS at
-        // the table length L, so the shape loops continuously at that rate.
-        %cpA   = arith.addf %cp, %stepE : f64
-        %cpR   = arith.select %atTrg, %vzero, %cpA : f64
-        %cpGeL = arith.cmpf oge, %cpR, %vL : f64
-        %cpW   = arith.subf %cpR, %vL : f64
-        %cpC   = arith.select %cpGeL, %cpW, %cpR : f64
-        // alpha = shared shape table at this voice's trigger-anchored, wrapping
-        // index. The table is host-filled and shared by every voice, so an edit
-        // re-voices all live notes while each keeps its own cp (its own phase).
-        %cpI   = arith.fptosi %cpC : f64 to i64
-        %cpIdx = arith.index_cast %cpI : i64 to index
-        %alpha = memref.load %vcsM[%cpIdx] : memref<8000xf64>
-        // per-voice one-pole low-pass on the saw; state reset at the trigger:
-        // y[n] = (1-alpha)*y[n-1] + alpha*saw
-        %oma   = arith.subf %vone, %alpha : f64
-        %ypR   = arith.select %atTrg, %vzero, %yp : f64
-        %lpA   = arith.mulf %oma, %ypR : f64
-        %lpB   = arith.mulf %alpha, %saw : f64
-        %yn    = arith.addf %lpA, %lpB : f64
-        // this voice's sample = filtered * gate * per-voice gain, stored into the
-        // voice's own row; dsp.reduce sums the rows into the tone after the loop.
-        %sg  = arith.mulf %yn, %gn : f64
-        %sgv = arith.mulf %sg, %vgain : f64
-        memref.store %sgv, %mixM[%v, %sn] : memref<8x128xf64>
-        affine.yield %gn, %pw, %cpC, %yn : f64, f64, f64, f64
-      }
-      // persist per-voice state; commit the pending target; consume the event
-      memref.store %res#0, %vgM[%v] : memref<8xf64>
-      memref.store %res#1, %vpM[%v] : memref<8xf64>
-      memref.store %res#2, %vcpM[%v] : memref<8xf64>
-      memref.store %res#3, %vlpM[%v] : memref<8xf64>
+      // batched-op inputs: saw ramp first value pre-advanced by one increment
+      // (the old loop used pr=pp+inc before shaping), the per-sample increment,
+      // the event frame in f64, the snapshotted previous gate target, the note-
+      // on-masked trigger frame (sentinel 128 unless a real note-on), the speed.
+      %phF   = arith.addf %phSt, %inc : f64
+      %trigF = arith.select %isOn, %efrF, %vNf : f64
+      memref.store %phF,   %sPhF[%v]  : memref<8xf64>
+      memref.store %inc,   %sInc[%v]  : memref<8xf64>
+      memref.store %efrF,  %sEfrF[%v] : memref<8xf64>
+      memref.store %tgt0,  %sTgt0[%v] : memref<8xf64>
+      memref.store %trigF, %sTrig[%v] : memref<8xf64>
+      memref.store %stepE, %sStep[%v] : memref<8xf64>
+      // carry the saw phase across blocks: frac(phSt + 128*inc) = the wrapped
+      // phase after the block's last sample (matches the old yielded pw[127]).
+      %phAdv = arith.mulf %vNf, %inc : f64
+      %phAcc = arith.addf %phSt, %phAdv : f64
+      %phFl  = math.floor %phAcc : f64
+      %phN   = arith.subf %phAcc, %phFl : f64
+      memref.store %phN,   %vpM[%v]  : memref<8xf64>
+      memref.store %freqE, %vfM[%v]  : memref<8xf64>
       memref.store %stepE, %vcstM[%v] : memref<8xf64>
-      memref.store %freqE, %vfM[%v] : memref<8xf64>
-      %tgtN = arith.select %hasEv, %eg, %tgt0 : f64
-      memref.store %tgtN, %vtM[%v] : memref<8xf64>
-      memref.store %vN, %efM[%v] : memref<8xi64>
+      %tgtN  = arith.select %hasEv, %eg, %tgt0 : f64
+      memref.store %tgtN,  %vtM[%v]  : memref<8xf64>
+      memref.store %vN,    %efM[%v]  : memref<8xi64>
     }
-    // @voice_mix now holds each voice's per-voice-FILTERED, gated samples in its
-    // own row: every voice was low-passed inside the loop above by its own cutoff
-    // envelope, anchored sample-accurately at that voice's trigger frame. Lift the
-    // 8x128 bank into tensor land and sum the voice axis with dsp.reduce to get the
-    // tone -- there is no post-sum, global low-pass and no in-kernel LFO any more
-    // (the old rank-1 dsp.lowPassFilter + phase-accumulator LFO + Mode-B breakpoint
-    // interpolator are all gone). The cross-voice mix used to be a hand-rolled
-    // in-loop add into a rank-1 scratch; it is now a first-class tensor reduce that
-    // fuses with the downstream d = tone + n0. The @lfo_* globals and the
-    // @set_value_lfo_* setters are retained, inert, only so the existing host
-    // still links; @run ignores them in this per-voice-cutoff variant.
-    %voices = "dsp.fromGlobal"() {global = @voice_mix} : () -> tensor<8x128xf64>
-    %tone = "dsp.reduce"(%voices) {axis = 0 : i64} : (tensor<8x128xf64>) -> tensor<128xf64>
+
+    // BATCHED PIPELINE (all rank-2 tensor<8x128>). Bridge the decode scratch and
+    // the shared cutoff-shape table into tensor land, then chain the primitives.
+    %tEg   = "dsp.fromGlobal"() {global = @voice_ev_gate}  : () -> tensor<8xf64>
+    %tEfrF = "dsp.fromGlobal"() {global = @vb_efrF}        : () -> tensor<8xf64>
+    %tTgt0 = "dsp.fromGlobal"() {global = @vb_tgt0}        : () -> tensor<8xf64>
+    %tTrig = "dsp.fromGlobal"() {global = @vb_trigfr}      : () -> tensor<8xf64>
+    %tPhF  = "dsp.fromGlobal"() {global = @vb_ph_first}    : () -> tensor<8xf64>
+    %tInc  = "dsp.fromGlobal"() {global = @vb_inc}         : () -> tensor<8xf64>
+    %tStep = "dsp.fromGlobal"() {global = @vb_step}        : () -> tensor<8xf64>
+    %tShape = "dsp.fromGlobal"() {global = @voice_cut_shape} : () -> tensor<8000xf64>
+    %vNt   = dsp.constant dense<1.280000e+02> : tensor<f64>
+    %z8    = dsp.constant dense<0.000000e+00> : tensor<8xf64>
+    %one2  = dsp.constant dense<1.000000e+00> : tensor<8x128xf64>
+    %two2  = dsp.constant dense<2.000000e+00> : tensor<8x128xf64>
+    %per1  = dsp.constant dense<1.000000e+00> : tensor<f64>
+    // gate target step/hold, then the one-pole gate smoother g += kc*(tgt - g):
+    // g[n] = (1-kc)*g[n-1] + kc*tgt[n]. The scan carries g across blocks.
+    %tgtT  = "dsp.eventToSignal"(%tEg, %tEfrF, %tTgt0, %vNt) : (tensor<8xf64>, tensor<8xf64>, tensor<8xf64>, tensor<f64>) -> tensor<8x128xf64>
+    %a1mkc = dsp.constant dense<0.990000e+00> : tensor<8x128xf64>
+    %akc   = dsp.constant dense<1.000000e-02> : tensor<8x128xf64>
+    %gateT = "dsp.scan"(%a1mkc, %akc, %tgtT) : (tensor<8x128xf64>, tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    // note-on reset pulse (1 at the trigger frame of a note-on, 0 elsewhere).
+    %trgT  = "dsp.eventToTrigger"(%tTrig, %vNt) : (tensor<8xf64>, tensor<f64>) -> tensor<8x128xf64>
+    %aCut  = "dsp.sub"(%one2, %trgT) : (tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>   // (1 - trg): coeff mask
+    // saw: per-voice ramp phase[v,n] = phF[v] + n*inc[v], branchless frac wrap,
+    // then 2*frac-1.
+    %phaseT = "dsp.getRangeOfVector"(%tPhF, %vNt, %tInc) : (tensor<8xf64>, tensor<f64>, tensor<8xf64>) -> tensor<8x128xf64>
+    %pwT   = "dsp.wrap"(%phaseT, %per1) : (tensor<8x128xf64>, tensor<f64>) -> tensor<8x128xf64>
+    %saw2  = "dsp.mul"(%two2, %pwT) : (tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    %sawT  = "dsp.sub"(%saw2, %one2) : (tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    // cutoff LFO phase: scan cp[n]=cp[n-1]+step, reset to 0 at trg (a=b=1-trg);
+    // %stepB broadcasts each voice's latched speed across the block (ramp step 0).
+    // The scan state grows unwrapped across blocks; wavetable wraps mod L=8000
+    // internally, so the shape index is identical (mod L) to the old wrapped cp.
+    %stepB = "dsp.getRangeOfVector"(%tStep, %vNt, %z8) : (tensor<8xf64>, tensor<f64>, tensor<8xf64>) -> tensor<8x128xf64>
+    %cphaseT = "dsp.scan"(%aCut, %aCut, %stepB) : (tensor<8x128xf64>, tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    %alphaT = "dsp.wavetable"(%tShape, %cphaseT) : (tensor<8000xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    // per-voice one-pole low-pass y[n] = (1-alpha)*y[n-1] + alpha*saw, state reset
+    // at the trigger via the a-coeff mask: a = (1-alpha)*(1-trg), b = alpha.
+    %omA   = "dsp.sub"(%one2, %alphaT) : (tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    %aLp   = "dsp.mul"(%omA, %aCut) : (tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    %lpT   = "dsp.scan"(%aLp, %alphaT, %sawT) : (tensor<8x128xf64>, tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    // mix: each voice = low-passed * gate, sum the 8 voices, scale by per-voice
+    // gain (0.2, uniform so it commutes with the reduce).
+    %vgT   = "dsp.mul"(%lpT, %gateT) : (tensor<8x128xf64>, tensor<8x128xf64>) -> tensor<8x128xf64>
+    %toneRaw = "dsp.reduce"(%vgT) {axis = 0 : i64} : (tensor<8x128xf64>) -> tensor<128xf64>
+    %vgainS = dsp.constant dense<2.000000e-01> : tensor<f64>
+    %tone  = "dsp.gain"(%toneRaw, %vgainS) : (tensor<128xf64>, tensor<f64>) -> tensor<128xf64>
 
     // --- desired d[n] = tone + colored noise ---
     %d = "dsp.add"(%tone, %n0) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>

@@ -321,18 +321,55 @@ Listed in implementation order (all **unaddressed**):
   bank is lifted with `dsp.fromGlobal` to `tensor<8x128>` and summed with
   `dsp.reduce {axis=0}`. `lms-noise-check.sh` passes 13/13 with a **bit-identical checksum**
   (`-2.749372436647139e+03`) under both `--opt` and `OPT=0`, i.e. a pure structural refactor.
-- [ ] 2. **Rank-2 `dsp.getRangeOfVector` -- batched ramp (per-row `first`/`step`).** Produces
+- [x] 2. **Rank-2 `dsp.getRangeOfVector` -- batched ramp (per-row `first`/`step`).** Produces
   `tensor<VxNxf64>` from a per-voice start and increment: the per-voice oscillator phase AND
   the cutoff-envelope phase are both this. Feedforward, closed-form in `n`; the only carried
   state is one scalar phase per row (the `@sample_offset` "implicit state" pattern generalised
   to a bank -- the feedforward scalar-state case), advanced across `--stream` blocks. Testable
   standalone before any scan exists.
-- [ ] 3. **`dsp.wavetable` / `dsp.lookup` -- batched table read.** Gathers a shared table
+  **Op done; kernel integration deferred to op 4.** The op now accepts rank-1 `first`/`step`
+  (`tensor<Vxf64>`) and emits a `tensor<VxNxf64>` batched ramp `y[v,n] = first[v] + n*step[v]`,
+  one independent arange per row; rank-0 `first` still gives the original rank-1 behaviour.
+  `inferShapes` prepends `V` when `first` is ranked >=1 (`Dialect.cpp`); the lowering branches
+  on `rank==2` for an outer per-row loop that loads `first[v]`/`step[v]` and runs the inner
+  1..N iter_arg recurrence (`LowerToAffineLoops.cpp`). Verified standalone via `--emit=jit`:
+  `first=[0,10], N=4, step=[1,2] => [[0 1 2 3][10 12 14 16]]`; rank-1 path unregressed
+  (`getRangeOfVector(0,5,2) => [0 2 4 6 8]`). **Not yet wired into `lms-noise.mlir`:** the only
+  candidate consumer is the sawtooth phase, but the kernel wraps phase with a per-sample
+  single-subtract (`if phase>=1: phase-=1`), valid only because `inc<1`. A closed-form ramp
+  `first+n*inc` grows unbounded over the block and needs a batched `frac`/`floor` (multi-wrap)
+  to become a sawtooth -- `dsp.modulo` has no scalar-broadcast form, so that shaping op is
+  out of scope here. Forcing an interim integration means a two-pass split with a saw `8x128`
+  round-trip plus duplicated event-decode -- a pessimization with no structural cleanup. The
+  batched ramp lands cleanly once op 4 (`dsp.scan`) replaces the fused per-sample voice loop;
+  ops 2/3/4 integrate into the voice bank together. No `02-` benchmark taken (kernel unchanged).
+- [x] 3. **`dsp.wavetable` / `dsp.lookup` -- batched table read.** Gathers a shared table
   (`tensor<Lxf64>`) at a batched, optionally fractional/wrapping index (`tensor<VxNxf64>`),
   with linear interpolation and index wrap. This is the generalised LFO / wavetable modulation
   source -- the `@voice_cut_shape` read at each voice's phase -- reusable for any mod source.
   Feedforward (a gather). **Replaces** the `memref.load %vcsM[%cpIdx]` per-voice table lookup.
-- [ ] 4. **`dsp.scan` -- ONE batched linear-recurrence op (the shared feedback primitive).**
+  **Op done; kernel integration deferred to the voice-bank rewrite.** `dsp.wavetable(table,
+  index)` gathers a rank-1 `table` (`tensor<Lxf64>`) at a fractional `index`: rank-1
+  `tensor<Nxf64>` gives one row, rank-2 `tensor<VxNxf64>` gathers one row per voice. Each
+  element is `pw = index mod L` (positive modulo via `p - floor(p/L)*L`, so negative phases
+  wrap too), `i0=floor(pw)`, `frac=pw-i0`, `i1=(i0+1) mod L`, and
+  `y = table[i0]*(1-frac) + table[i1]*frac` -- linear interpolation with table wrap-around, a
+  strict superset of the kernel's current truncate-and-single-subtract lookup. Wired
+  end-to-end: `Ops.td` `WavetableOp`, `Dialect.cpp` (build/inferShapes=index shape/verify:
+  table rank-1, index rank 1-2), `WavetableOpLowering` in `LowerToAffineLoops.cpp` (affine
+  iteration over the index, data-dependent `memref.load` for the two table taps), and a
+  `wavetable(table,index)` frontend builtin in `MLIRGen.cpp`. Stateless -- no
+  `StreamStateMaterialization` entry. Verified standalone via `--emit=jit` with table
+  `[10,20,30,40]`: rank-1 `idx=[0,0.5,1,2.5,3.5,4] => 10 15 20 35 25 10` (the 4.0 wraps to
+  table[0]); rank-2 batched matches; negative wrap `idx=[-0.5,-4] => 25 10`; compiles clean
+  under `--stream --opt`. **Not yet wired into `lms-noise.mlir`:** same fused-loop blocker as
+  ops 2/4 -- the cutoff lookup lives inside the per-sample voice loop alongside four
+  recurrences, so replacing just `memref.load %vcsM[%cpIdx]` needs the loop split and an
+  `8x128` cutoff-phase intermediate materialised (that phase in turn is the batched
+  `getRangeOfVector` ramp from op 2, gated by op 5's trigger reset). Lands wholesale in the
+  voice-bank rewrite. No `03-` benchmark taken (kernel unchanged); `lms-noise-check.sh` stays
+  13/13, checksum `-2.749372436647139e+03`.
+- [x] 4. **`dsp.scan` -- ONE batched linear-recurrence op (the shared feedback primitive).**
   Expresses `y[.,n] = a[.,n]*y[.,n-1] + b[.,n]*x[.,n]` with per-row carried state
   (`memref<Vxkf64>`), generalising to biquad / state-space (k-th order). Coefficients may be
   per-sample tensors so the cutoff can sweep. **This single op covers the per-voice one-pole
@@ -343,7 +380,29 @@ Listed in implementation order (all **unaddressed**):
   signal) so a voice's filter state clears at its note-on frame instead of inheriting a stolen
   voice's tail -- the one wrinkle the batched form must own; that reset signal is produced by
   op 5.
-- [ ] 5. **`dsp.eventToSignal` -- expand sparse timestamped events into a dense control
+  **Op done (first-order, k=1); kernel integration + reset input deferred.** `dsp.scan(a,b,x)`
+  takes three same-shaped operands and runs `y[n] = a[n]*y[n-1] + b[n]*x[n]`: rank-1
+  `tensor<Nxf64>` is a single recurrence, rank-2 `tensor<VxNxf64>` runs V independent rows.
+  `y[.,-1]` is carried across `--stream` blocks from a zero-init state global
+  (`__stream_state_scan_*`, `memref<Vxf64>`) materialised in `StreamStateMaterializationPass`
+  and read/written exactly like the one-pole; the inner affine loop carries `y[n-1]` in an
+  iter_arg so `n==0` consumes the seed. Wired end-to-end: `Ops.td` `ScanOp`, `Dialect.cpp`
+  (build/inferShapes/verify -- operands must share shape, rank 1 or 2), `ScanOpLowering` in
+  `LowerToAffineLoops.cpp`, and a `scan(a,b,x)` frontend builtin in `MLIRGen.cpp`. Verified
+  standalone via `--emit=jit`: rank-1 one-pole (`a=b=0.5, x=1s => 0.5 0.75 0.875 0.9375`) and
+  rank-2 batched (`row0` one-pole, `row1` a=0 => `b*x`); compiles clean under `--stream --opt`
+  (no heap). **k>=2 (biquad/state-space) and the per-sample reset input are NOT implemented** --
+  the reset input has no producer until op 5 (`dsp.eventToSignal`), so adding it now would be a
+  half-finished operand with no consumer. **Not yet wired into `lms-noise.mlir`:** same
+  structural blocker as op 2 -- the four voice recurrences (gate one-pole, saw ramp, cutoff
+  ramp+reset, low-pass one-pole+reset) live in a single fused per-sample loop; pulling one
+  recurrence into a scan means splitting that loop, materialising several `8x128` intermediates
+  and duplicating the event decode (a pessimization), and the two reset-bearing recurrences
+  additionally need op 5's trigger signal. The batched voice bank lands wholesale once ops 3
+  (`wavetable`) and 5 (`eventToSignal`) exist -- plus a batched saw-shaping (`frac`) step -- so
+  ramp/wavetable/scan/eventToSignal replace the fused loop together. No `03-` benchmark taken
+  (kernel unchanged); `lms-noise-check.sh` stays 13/13, checksum `-2.749372436647139e+03`.
+- [x] 5. **`dsp.eventToSignal` -- expand sparse timestamped events into a dense control
   tensor.** Takes the per-row `(value, frame)` event record (`tensor<Vxf64>` value +
   `tensor<Vxi64>` frame, one pending per row per block -- the shape the kernel already
   prototypes) plus a previous-value carry, and emits a dense `tensor<VxNxf64>` step/ramp
@@ -353,11 +412,96 @@ Listed in implementation order (all **unaddressed**):
   feedforward tensor math that is **sample-accurate without block splitting**. Feedforward (a
   scatter + hold/interpolate). Built last because it ties the MIDI/automation front end into
   the scan/ramp pipeline the first four ops establish.
+  **Ops done (split into two single-result ops); kernel integration deferred to the voice-bank
+  rewrite.** Because the toy frontend ops are single-result (same reason FFT is split into
+  real/img ops), this landed as a pair: `dsp.eventToSignal(value, frame, prev, N)` emits the
+  step/hold control `out[.,n] = (n < frame) ? prev : value`, and `dsp.eventToTrigger(frame, N)`
+  emits the reset pulse `trig[.,n] = (n == frame) ? 1 : 0`. Both take scalar events (-> rank-1
+  `tensor<Nxf64>`) or rank-1 per-row events `tensor<Vxf64>` (-> rank-2 `tensor<VxNxf64>`); a
+  sentinel `frame >= N` leaves a row all-`prev` / all-zero (the "no event this block" case,
+  exactly the kernel's `%hasEv = efrI < 128` guard). `frame` is carried as an f64 whole number
+  and `N` is the scalar constant length (the `getRangeOfVector` convention), so both are
+  frontend-testable. Whether an event is a note-on (fire the filter reset) stays a consumer-side
+  AND with a `value > 0.5` mask, matching the kernel's `%isOn`. Wired end-to-end: `Ops.td`
+  (`EventToSignalOp`, `EventToTriggerOp`), `Dialect.cpp` (build/inferShapes via shared
+  `inferEventShape` -> `[V,N]` or `[N]` / verify: operands share shape, scalar-or-rank-1),
+  `EventToSignalOpLowering` + `EventToTriggerOpLowering` in `LowerToAffineLoops.cpp`, and both
+  `eventToSignal`/`eventToTrigger` frontend builtins in `MLIRGen.cpp`. Stateless -- no
+  `StreamStateMaterialization` entry (the `prev` carry is passed in explicitly; under a full
+  rewrite it would come from the persisted gate/cutoff-target globals). Verified standalone via
+  `--emit=jit`: scalar `val=1,frame=3,prev=0,N=6 => sig 0 0 0 1 1 1 / trg 0 0 0 1 0 0`; batched
+  `val=[1,9],frame=[2,99],prev=[0,5],N=4 => sig [[0 0 1 1][5 5 5 5]] / trg [[0 0 1 0][0 0 0 0]]`
+  (row1's out-of-range frame 99 -> all-prev, no trigger); compiles clean under `--stream --opt`.
+  **Not yet wired into `lms-noise.mlir`:** produces exactly the two signals (`%tgt` step/hold and
+  `%atTrg` reset) the fused voice loop computes inline today, so this is the last missing piece
+  for the wholesale rewrite -- see the integration note below. No `04-` benchmark taken (kernel
+  unchanged); `lms-noise-check.sh` stays 13/13, checksum `-2.749372436647139e+03`.
 
 Ops 1 and 4 (`dsp.reduce`, `dsp.scan`) are the load-bearing ones; 2, 3, 5 are thin. Rank-2
 `getRangeOfVector`, `dsp.reduce` and `dsp.scan` are exactly the option-3 primitives called out
 above; `dsp.wavetable` and `dsp.eventToSignal` complete the chain so the *whole* demo -- not
 just the voice waveform -- lives in tensor land.
+
+**Status: all five primitives implemented AND the voice bank has been rebuilt wholesale in
+tensor land** (`lms-noise.mlir`, `bench-out/02-all-applied.log`). The hand-rolled fused per-
+sample voice loop is gone; the batched rank-2 `tensor<8x128>` pipeline is:
+
+    // per block, all batched over the 8 voices (rank-2 tensor<8x128>):
+    tgt   = eventToSignal(ev_gate, vb_efrF, vb_tgt0, 128)          // gate target step/hold
+    trg   = eventToTrigger(vb_trigfr, 128)   // frame sentinel-masked to note-ons only
+    gate  = scan(0.99, 0.01, tgt)                                  // one-pole gate smoother
+    phase = getRangeOfVector(vb_ph_first, 128, vb_inc)             // per-voice saw ramp
+    saw   = 2*wrap(phase, 1.0) - 1                                 // branchless frac sawtooth
+    cphase= scan(1-trg, 1-trg, stepB)                              // cutoff LFO phase (reset@trg)
+    alpha = wavetable(voice_cut_shape, cphase)                     // per-voice cutoff (wraps modL)
+    lp    = scan((1-alpha)*(1-trg), alpha, saw)                    // per-voice low-pass (reset@trg)
+    tone  = gain(reduce(lp * gate, axis=0), 0.2)                   // mix 8 voices -> tensor<128>
+
+The two prerequisites flagged earlier were resolved without new op surface: (a) **reset via
+coefficient masking** (Q1) -- forcing the scan feedback coeff `a[.,f]=0` at the trigger frame
+drops the carried state, so neither reset-bearing scan needs a per-sample reset operand; the
+cutoff phase resets to 0 with `a=b=(1-trg)` and the low-pass masks its `a` with `(1-trg)`; and
+(b) **`dsp.wrap`** (Q2) -- a branchless floor-subtract (`x - floor(x/period)*period`, HW
+`frintm`, vectorizes) replaces the magnitude-unsafe single-subtract saw wrap, and the cutoff
+`wavetable` wraps mod-L=8000 internally so the unwrapped growing scan phase indexes correctly.
+The saw phase resets **block-level** (its pre-trigger portion is gated to ~0), so it stays a
+plain per-voice ramp; only the cutoff phase and low-pass state reset sample-accurately.
+
+A small 8-iteration block-level DECODE loop still resolves each voice's pending MIDI event into
+the flat control vectors (`@vb_*` scratch globals) the batched ops consume, and commits the
+carried per-voice state (freq, saw phase, gate target, cutoff speed; consume the event). The
+three scans each carry their own `--stream` state global (gate value, cutoff phase, low-pass
+state), replacing the old `@voice_gate` / `@voice_cut_phase` / `@voice_lp_state` manual carries
+(those globals are now vestigial). `lms-noise-check.sh` stays **13/13**; the golden checksum
+moves to `-2.749372436647042e+03` (was `...139e+03`) -- a ~1e-10 relative shift, expected from
+(i) `wavetable`'s linear interpolation vs the old truncated table load, (ii) the cutoff scan's
+unwrapped-vs-wrapped state carry (identical mod-L index, differs only in float rounding), and
+(iii) fusion reassociation. This is a genuine numerical change, so the bit-identity checksum no
+longer holds; the 13 threshold checks are authoritative.
+
+**Toolchain gap surfaced + fixed.** The affine loop-fusion pass (`--opt`) materializes tiny
+private scratch memrefs for fused producer/consumer slices; for the rank-1 chains
+`AffineScalarReplacement` forwards them away, but the rank-2 batched chains leave ~8
+`memref<1x1xf64>` **heap** allocs that `AssertNoHeapAlloc` (rightly) rejects. Fixed in
+`toyc.cpp` by running `bufferization::PromoteBuffersToStack` (64 KiB cap, rank<=4,
+non-escaping) just before the no-heap check -- exactly the remedy that pass's own error message
+prescribes; it needs `memref::registerAllocationOpInterfaceExternalModels(registry)`.
+
+**Result (`bench-out/02-all-applied.log`, vs `00-baseline.log`): a ~25-28% latency REGRESSION**
+(full_white_poly8 median 0.01128 ms vs 0.00885 ms; regression is uniform across all four
+configs, including idle `rest_silent` 0.01104 vs 0.00859 ms). Static footprint is flat (no heap;
+`__data` 65608 vs 65400 B). *Why it regressed here:* the batched form's Axis-A1 win (the V=8
+voice axis is embarrassingly parallel) needs an actual **vectorizer** to pay off, and
+`createAffineVectorizePass` is commented out of the `--opt` pipeline, so the V axis lowers to
+scalar loops. Without SIMD, the batched pipeline just pays extra buffer-materialization/traffic
+for its ~14 rank-2 intermediates and the `wavetable` lerp (2 loads + interp vs 1 truncated load),
+which the old single tight voice-outer/sample-inner nest (everything in scalar iter_args, zero
+intermediate buffers) avoided. Still **~257x real-time** (0.39% of the 2.9025 ms block), so the
+regression is far from the budget. The rewrite delivers the *structural* goals -- tensor-land
+end-to-end, composable/reusable primitives, one `dsp.scan` feedback primitive, the `@voice_mix`+
+`fromGlobal` escape hatch dropped -- and sets up the real speedup lever: **enable the affine
+vectorizer** (or a hand `--emit` NEON path) so the V axis becomes actual SIMD; that is the next
+data point to capture (`bench-out/03-vectorized.log` or similar).
 
 ### Why we choose these
 
