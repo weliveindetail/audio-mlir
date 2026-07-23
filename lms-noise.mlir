@@ -126,9 +126,10 @@ module {
   // voice's @voice_cut_step at that voice's note-on, so changing it re-speeds only
   // notes triggered afterwards -- already-sounding voices keep their latched speed.
   memref.global "public" @cut_lfo_step : memref<f64> = dense<1.000000e+00>
-  // Per-block scratch the voice loop sums into, then bridges to tensor land via
-  // dsp.fromGlobal (no to_tensor hook in this toolchain). Private.
-  memref.global "private" @voice_mix : memref<128xf64> = dense<0.000000e+00>
+  // Per-block scratch the voice loop writes PER VOICE (one row per voice), then
+  // bridges to tensor land via dsp.fromGlobal and sums across voices with
+  // dsp.reduce (no to_tensor hook in this toolchain). Private.
+  memref.global "private" @voice_mix : memref<8x128xf64> = dense<0.000000e+00>
   // Low-pass cutoff-LFO period in samples (interactive): the automation speed.
   // A smaller period = faster sweep (LFO Hz = 44100 / period; default 147000 ≈
   // 0.3 Hz). This is now the *held/current* value of the parameter: the host no
@@ -288,7 +289,7 @@ module {
     %efM   = memref.get_global @voice_ev_frame : memref<8xi64>
     %egM   = memref.get_global @voice_ev_gate  : memref<8xf64>
     %erM   = memref.get_global @voice_ev_freq  : memref<8xf64>
-    %mixM  = memref.get_global @voice_mix      : memref<128xf64>
+    %mixM  = memref.get_global @voice_mix      : memref<8x128xf64>
     // per-voice cutoff-envelope constants (the LFO is gone; each voice reads its
     // alpha from the shared @voice_cut_shape table at its own trigger-anchored
     // phase, so all voices share one shape but keep independent positions).
@@ -301,11 +302,10 @@ module {
     // into a voice's own @voice_cut_step at its note-on (see the loop below).
     %vstepM = memref.get_global @cut_lfo_step : memref<f64>
     %vstepNew = memref.load %vstepM[] : memref<f64>
-    // clear the mix accumulator for this block
-    affine.for %z = 0 to 128 {
-      memref.store %vzero, %mixM[%z] : memref<128xf64>
-    }
-    // sum the 8 voices into @voice_mix, each low-passed by its OWN cutoff envelope
+    // Each voice writes its own row of @voice_mix (memref<8x128>); the cross-voice
+    // sum is now a tensor-land dsp.reduce after the loop, not an in-loop add. Every
+    // [v, sn] slot is written exactly once below, so no pre-clear is needed.
+    // Render the 8 voices into @voice_mix, each low-passed by its OWN cutoff envelope
     // anchored sample-accurately at that voice's trigger frame (option A of the
     // notes.md voice-bank options: the per-voice one-pole is an extra iter_arg,
     // the cutoff envelope another per-voice phase carried across blocks).
@@ -377,12 +377,11 @@ module {
         %lpA   = arith.mulf %oma, %ypR : f64
         %lpB   = arith.mulf %alpha, %saw : f64
         %yn    = arith.addf %lpA, %lpB : f64
-        // mix += filtered * gate * per-voice gain
+        // this voice's sample = filtered * gate * per-voice gain, stored into the
+        // voice's own row; dsp.reduce sums the rows into the tone after the loop.
         %sg  = arith.mulf %yn, %gn : f64
         %sgv = arith.mulf %sg, %vgain : f64
-        %cur = memref.load %mixM[%sn] : memref<128xf64>
-        %acc = arith.addf %cur, %sgv : f64
-        memref.store %acc, %mixM[%sn] : memref<128xf64>
+        memref.store %sgv, %mixM[%v, %sn] : memref<8x128xf64>
         affine.yield %gn, %pw, %cpC, %yn : f64, f64, f64, f64
       }
       // persist per-voice state; commit the pending target; consume the event
@@ -396,15 +395,19 @@ module {
       memref.store %tgtN, %vtM[%v] : memref<8xf64>
       memref.store %vN, %efM[%v] : memref<8xi64>
     }
-    // The voice mix now already holds the per-voice-FILTERED, gated sum: each
-    // voice was low-passed inside the loop above by its own cutoff envelope,
-    // anchored sample-accurately at that voice's trigger frame. So the summed
-    // signal IS the tone -- there is no post-sum, global low-pass and no in-kernel
-    // LFO any more (the old rank-1 dsp.lowPassFilter + phase-accumulator LFO +
-    // Mode-B breakpoint interpolator are all gone). The @lfo_* globals and the
+    // @voice_mix now holds each voice's per-voice-FILTERED, gated samples in its
+    // own row: every voice was low-passed inside the loop above by its own cutoff
+    // envelope, anchored sample-accurately at that voice's trigger frame. Lift the
+    // 8x128 bank into tensor land and sum the voice axis with dsp.reduce to get the
+    // tone -- there is no post-sum, global low-pass and no in-kernel LFO any more
+    // (the old rank-1 dsp.lowPassFilter + phase-accumulator LFO + Mode-B breakpoint
+    // interpolator are all gone). The cross-voice mix used to be a hand-rolled
+    // in-loop add into a rank-1 scratch; it is now a first-class tensor reduce that
+    // fuses with the downstream d = tone + n0. The @lfo_* globals and the
     // @set_value_lfo_* setters are retained, inert, only so the existing host
     // still links; @run ignores them in this per-voice-cutoff variant.
-    %tone = "dsp.fromGlobal"() {global = @voice_mix} : () -> tensor<128xf64>
+    %voices = "dsp.fromGlobal"() {global = @voice_mix} : () -> tensor<8x128xf64>
+    %tone = "dsp.reduce"(%voices) {axis = 0 : i64} : (tensor<8x128xf64>) -> tensor<128xf64>
 
     // --- desired d[n] = tone + colored noise ---
     %d = "dsp.add"(%tone, %n0) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>

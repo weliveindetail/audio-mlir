@@ -307,13 +307,20 @@ primitive that every recurrence in the toolkit shares.
 
 Listed in implementation order (all **unaddressed**):
 
-- [ ] 1. **`dsp.reduce` -- sum (or other reduction) over ONE axis.** Collapses
+- [x] 1. **`dsp.reduce` -- sum (or other reduction) over ONE axis.** Collapses
   `tensor<VxNxf64> -> tensor<Nxf64>` (V = voices), the batched-voice mixer. Smallest,
   stateless, self-contained, and unblocks every batched result below, so it goes first.
   `dsp.sum` collapses *all* elements to a scalar and cannot collapse just V; this is the
   missing per-axis form. Feedforward. **Replaces** the `@voice_mix` store + `dsp.fromGlobal`
   bridge -- the summed tone becomes an ordinary tensor that fuses with the downstream
   `d = tone + n0`.
+  **Done.** Op added (`Ops.td` `ReduceOp`, `axis` attr default 0, rank-2 -> rank-1),
+  shape-inference + verifier in `Dialect.cpp`, `ReduceOpLowering` (nested affine loop with
+  an inner iter_arg accumulator) in `LowerToAffineLoops.cpp`. The kernel's `@voice_mix` is
+  now `memref<8x128>` (one row per voice, no in-loop cross-voice add, no pre-clear); the
+  bank is lifted with `dsp.fromGlobal` to `tensor<8x128>` and summed with
+  `dsp.reduce {axis=0}`. `lms-noise-check.sh` passes 13/13 with a **bit-identical checksum**
+  (`-2.749372436647139e+03`) under both `--opt` and `OPT=0`, i.e. a pure structural refactor.
 - [ ] 2. **Rank-2 `dsp.getRangeOfVector` -- batched ramp (per-row `first`/`step`).** Produces
   `tensor<VxNxf64>` from a per-voice start and increment: the per-voice oscillator phase AND
   the cutoff-envelope phase are both this. Feedforward, closed-form in `n`; the only carried
