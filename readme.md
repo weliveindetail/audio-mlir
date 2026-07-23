@@ -24,6 +24,18 @@ Make sure to use sccache for development.
 ## Build the sample
 
 Right now, this repo only contains one sample app.
+It's a small but complete synth-plus-canceller signal chain that exercises, in kernel order:
+* sample-accurate MIDI note events triggering a polyphonic bank of sawtooth oscillators;
+* a click-free one-pole gate envelope shaping each voice's amplitude
+* a per-voice swept low-pass filter whose cutoff is modulated by a shared wavetable LFO ...
+* ... read at each voice's own trigger-anchored phase
+* a mixer summing the voices into a tone
+* a runtime-selectable colored-noise source (white/pink/brown/ou/none) ...
+* ... shaped through delay lines into an acoustic path
+* a second mixer burying the tone in that noise;
+* a 32-tap LMS adaptive filter that learns the noise path;
+* a final wet/dry mix that subtracts the estimate to reveal the tone
+
 The audio-mlir dialect itself is (still) implemented in-tree in the LLVM fork above.
 The sample is an LMS adaptive noise canceller: a swept-filtered sawtooth tone is
 buried in broadband noise, and a 32-tap adaptive FIR removes the noise to reveal

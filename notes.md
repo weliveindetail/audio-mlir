@@ -282,6 +282,100 @@ linear recurrences can be blocked in parallel via an associative scan or a state
 transition-matrix form (`y_block = f(state, x_block)`) instead of a naive map. Worth knowing
 the option exists before committing to always-sequential scan lowering.
 
+## What ops to add (the composable primitive set)
+
+The demo now exercises the full concept chain the readme enumerates -- sample-accurate MIDI
+events -> polyphonic sawtooth bank -> per-voice gate envelope -> per-voice swept low-pass
+(cutoff from a shared wavetable LFO at each voice's trigger-anchored phase) -> voice mixer ->
+runtime-selectable colored noise through a delay-line acoustic path -> tone+noise mixer ->
+32-tap LMS -> wet/dry mix. Today most of that (the voice bank, its gate, its per-voice
+cutoff filter) is a **hand-rolled affine loop nest** bridged back to tensor land with
+`dsp.fromGlobal` (`lms-noise.mlir`), which is opaque to fusion, vectorization and the Axis-B
+rewrites. The plan is to express the whole chain as a **small set of composable tensor/scan
+primitives** so it stays in tensor land end-to-end.
+
+This is deliberately **option 3** from the voice-bank discussion above (shared batched
+primitives), **not option 4** (a monolithic `dsp.osc`/`dsp.voice` scan op). Folding the four
+per-voice recurrences into one op is the opposite of small/reusable, and the primitives below
+are needed regardless -- biquads, smoothers, LFOs, mixers and the noise/LMS scans all reuse
+them. If the `dsp.voice` sugar is ever wanted, it becomes a fusion/macro that lowers to these,
+not a separate optimization regime.
+
+The set splits cleanly along the feedforward/feedback line from the previous section: four
+feedforward tensor maps (ramp, wavetable, reduce, event-expansion) plus **one** feedback scan
+primitive that every recurrence in the toolkit shares.
+
+Listed in implementation order (all **unaddressed**):
+
+- [ ] 1. **`dsp.reduce` -- sum (or other reduction) over ONE axis.** Collapses
+  `tensor<VxNxf64> -> tensor<Nxf64>` (V = voices), the batched-voice mixer. Smallest,
+  stateless, self-contained, and unblocks every batched result below, so it goes first.
+  `dsp.sum` collapses *all* elements to a scalar and cannot collapse just V; this is the
+  missing per-axis form. Feedforward. **Replaces** the `@voice_mix` store + `dsp.fromGlobal`
+  bridge -- the summed tone becomes an ordinary tensor that fuses with the downstream
+  `d = tone + n0`.
+- [ ] 2. **Rank-2 `dsp.getRangeOfVector` -- batched ramp (per-row `first`/`step`).** Produces
+  `tensor<VxNxf64>` from a per-voice start and increment: the per-voice oscillator phase AND
+  the cutoff-envelope phase are both this. Feedforward, closed-form in `n`; the only carried
+  state is one scalar phase per row (the `@sample_offset` "implicit state" pattern generalised
+  to a bank -- the feedforward scalar-state case), advanced across `--stream` blocks. Testable
+  standalone before any scan exists.
+- [ ] 3. **`dsp.wavetable` / `dsp.lookup` -- batched table read.** Gathers a shared table
+  (`tensor<Lxf64>`) at a batched, optionally fractional/wrapping index (`tensor<VxNxf64>`),
+  with linear interpolation and index wrap. This is the generalised LFO / wavetable modulation
+  source -- the `@voice_cut_shape` read at each voice's phase -- reusable for any mod source.
+  Feedforward (a gather). **Replaces** the `memref.load %vcsM[%cpIdx]` per-voice table lookup.
+- [ ] 4. **`dsp.scan` -- ONE batched linear-recurrence op (the shared feedback primitive).**
+  Expresses `y[.,n] = a[.,n]*y[.,n-1] + b[.,n]*x[.,n]` with per-row carried state
+  (`memref<Vxkf64>`), generalising to biquad / state-space (k-th order). Coefficients may be
+  per-sample tensors so the cutoff can sweep. **This single op covers the per-voice one-pole
+  low-pass, the click-free gate smoother (also a one-pole), and -- in matrix form -- the
+  colored-noise filters and any IIR.** State flows through `StreamStateMaterialization` (a
+  module-scope global per op instance), sized `V`-wide, exactly like `dsp.lowPassFilter` /
+  `dsp.lmsFilterResponse` today. Needs an optional **per-sample reset input** (a gate/trigger
+  signal) so a voice's filter state clears at its note-on frame instead of inheriting a stolen
+  voice's tail -- the one wrinkle the batched form must own; that reset signal is produced by
+  op 5.
+- [ ] 5. **`dsp.eventToSignal` -- expand sparse timestamped events into a dense control
+  tensor.** Takes the per-row `(value, frame)` event record (`tensor<Vxf64>` value +
+  `tensor<Vxi64>` frame, one pending per row per block -- the shape the kernel already
+  prototypes) plus a previous-value carry, and emits a dense `tensor<VxNxf64>` step/ramp
+  control signal, together with the per-sample **trigger/reset** signal `dsp.scan` consumes.
+  This is the notes.md "compute a tensor per parameter over its value-over-time" direction: it
+  turns the gate target, the cutoff automation and (generalised) any knob like `@wet` into
+  feedforward tensor math that is **sample-accurate without block splitting**. Feedforward (a
+  scatter + hold/interpolate). Built last because it ties the MIDI/automation front end into
+  the scan/ramp pipeline the first four ops establish.
+
+Ops 1 and 4 (`dsp.reduce`, `dsp.scan`) are the load-bearing ones; 2, 3, 5 are thin. Rank-2
+`getRangeOfVector`, `dsp.reduce` and `dsp.scan` are exactly the option-3 primitives called out
+above; `dsp.wavetable` and `dsp.eventToSignal` complete the chain so the *whole* demo -- not
+just the voice waveform -- lives in tensor land.
+
+### Why we choose these
+
+- **Small and composable over monolithic.** Each op is independently specifiable, testable and
+  reusable across the toolkit (biquads, smoothers, LFOs, mixers, the noise/LMS scans), whereas
+  a single `dsp.voice` folding four recurrences is a one-off. The `dsp.voice` sugar, if ever
+  wanted, lowers to these -- an organisational choice, not a different optimiser regime.
+- **Stay in tensor land / drop the escape hatch.** `dsp.reduce` removes the `@voice_mix` +
+  `dsp.fromGlobal` bridge, so the bank is tensor-typed end-to-end and fuses with the downstream
+  add/LMS/mix instead of being pinned apart by a hand-written loop.
+- **Vectorization (Axis A1).** A batched `tensor<VxNxf64>` voice dimension makes the V axis
+  embarrassingly parallel -- the oscillator/gate/lookup maps vectorize across voices (NEON),
+  which the current voice-outer/sample-inner nest is opaque to.
+- **One recurrence to optimize (Axis B1).** A single `dsp.scan` is the *one* place to apply the
+  state-space blocking / parallel-scan escape hatch, instead of re-deriving it for each bespoke
+  loop (per-voice low-pass, gate, pink/brown/ou, LMS). Consolidating the feedback class is the
+  leverage.
+- **Automation as tensors (`dsp.eventToSignal`).** Expanding `(value, frame)` events into a
+  dense control tensor makes control-rate params sample-accurate while keeping them feedforward
+  -- no block splitting, no grown `@run` ABI -- and generalises the timestamped-setter pattern
+  the kernel already prototypes to every knob.
+- **Clean feedforward/feedback split.** Ramp, wavetable, reduce and event-expansion are
+  feedforward tensor maps; `dsp.scan` is the single feedback primitive. That is exactly the
+  state model that scales from the previous section, now made concrete as an op set.
+
 ## Performance Improvements
 
 The reference kernel for this section is `lms-noise.mlir` (the streaming adaptive
