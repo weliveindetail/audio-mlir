@@ -81,13 +81,15 @@
   <section class="panel" id="lmsPanel">
     <h2>LMS Adaptive Noise Canceller</h2>
     <p class="desc">
-      A swept-low-pass sawtooth — now MIDI-triggered from the on-screen piano — buried in
+      A swept-low-pass sawtooth — MIDI-triggered from the on-screen piano — buried in
       colored noise; a 32-tap LMS adaptive FIR learns the noise path and subtracts it.
       <code>@noise_kind</code> picks the color, <code>@wet</code> sweeps how much of the
-      estimate to remove (0 = noisy, 1 = tone revealed), and the host streams a user-drawn
-      cutoff-sweep LFO shape as per-block breakpoints (<code>@lfo_mode</code> = 1); Sweep
-      stretches/compresses that shape over time. Play a note to hear the canceller pull the
-      noise out of the tone (a rest cancels pure noise — the trivial case).
+      estimate to remove (0 = noisy, 1 = tone revealed). Each voice runs its own
+      trigger-anchored cutoff LFO through the shared <code>@voice_cut_shape</code> table
+      you draw below; Sweep sets <code>@cut_lfo_step</code>, the LFO speed <em>latched per
+      voice at note-on</em> (so it only affects notes played afterwards). Play a note to
+      hear the canceller pull the tone out of the noise (a rest cancels pure noise — the
+      trivial case).
     </p>
     <div class="row">
       <button id="lmsStart" class="primary">▶ Start audio</button>
@@ -139,7 +141,7 @@
       <div class="piano-tools">
         <button id="pianoToggle" class="active">Piano</button>
         <span class="piano-hint">Click a key — or press its letter — to start/stop a note
-          (toggle). One octave C4..C5.</span>
+          (toggle). One octave C3..C4.</span>
       </div>
       <div id="pianoPanel">
         <div class="pkeys" id="pkeys"></div>
@@ -165,23 +167,24 @@ const PAGE = 65536;
 const INITIAL_PAGES = 512;   // 32 MiB — one run's scratch fits with room to spare
 const align = (x, a) => (x + (a - 1)) & ~(a - 1);
 
-// Host-side cutoff LFO ("mode B"): instead of the kernel deriving the sweep from
-// its own phase accumulator (mode A), the host streams the LFO shape as per-block
-// breakpoints and the kernel linearly interpolates between them. This mirrors the
-// native driver's emitLfoBlock(). The shape is a 128-slot curve the user draws in
-// the editor (values in [0,1]); the Sweep control stretches/compresses it via
-// lfoPeriod (samples per cycle). The kernel maps the [0,1] shape onto the filter
-// coefficient's usable range — a 0..1 triangle reproduces the old hard-coded LFO.
-const LFO_BP_STRIDE = 8;                    // breakpoint every 8 frames + the last
+// Per-voice cutoff LFO: the kernel holds a shared @voice_cut_shape table — one
+// cycle of the low-pass coefficient — and every voice reads it at its OWN
+// trigger-anchored, wrapping phase (advancing by the per-voice @cut_lfo_step it
+// latched at note-on). The host owns the SHAPE: we fill that table directly in
+// linear memory from the 128-slot curve the user draws in the editor (values in
+// [0,1], mapped onto the coefficient range), mirroring the native driver's
+// fillCutShape(). This replaces the old host-streamed breakpoint LFO entirely.
+const CUT_TABLE_LEN = 8000;                 // MUST match the kernel memref<8000xf64>
 const CURVE_LEN     = 128;                  // one LFO cycle == one editor curve
 const ALPHA_MIN = 0.02, ALPHA_SPAN = 0.33; // curve [0,1] → cutoff coeff [0.02, 0.35]
 
 function createKernel({ url, blockSamples }) {
   let memory, f64, u8, dv, exports = null;
   let bump = 0, OUT_PTR = 0, DESC_PTR = 0, ARENA_BASE = 0;
-  let hostPhase = 0, lfoPeriod = 147000;     // ~0.3 Hz at 44.1 kHz until Sweep sets it
+  let cutStep = 1.0;                         // @cut_lfo_step shadow (entries/sample)
   // The LFO shape as one cycle of CURVE_LEN values in [0,1]; defaults to a
-  // triangle (matching the old hard-coded shape) until the editor pushes one.
+  // triangle until the editor pushes one. Written into @voice_cut_shape on load
+  // and on every edit (resampled to CUT_TABLE_LEN entries).
   let curve = Array.from({ length: CURVE_LEN }, (_, i) =>
     1 - Math.abs(2 * (i / (CURVE_LEN - 1)) - 1));
 
@@ -217,7 +220,6 @@ function createKernel({ url, blockSamples }) {
     const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), imports);
     exports = instance.exports;
     exports.__wasm_call_ctors?.();             // run static ctors (initialises data)
-    dv.setBigInt64(exports.lfo_mode.value, 1n, true);  // mode B: host streams the LFO
 
     // One-block output buffer above the kernel heap, then the descriptor, then
     // the per-call bump arena. The kernel writes exactly blockSamples per @run
@@ -235,6 +237,10 @@ function createKernel({ url, blockSamples }) {
     dv.setBigInt64(DESC_PTR +  8, 0n, true);
     dv.setBigInt64(DESC_PTR + 16, BigInt(blockSamples), true);
     dv.setBigInt64(DESC_PTR + 24, 1n, true);
+
+    // Seed the shared cutoff-shape table from the current curve (the kernel only
+    // inits it to a flat splat), so the first voice is shaped from the start.
+    writeShapeTable();
   }
 
   // Write an exported parameter global (exported as its i32 address). f64 knobs
@@ -244,10 +250,30 @@ function createKernel({ url, blockSamples }) {
   const setParam    = (name, value) => { dv.setFloat64(exports[name].value, value, true); };
   const setParamI64 = (name, value) => { dv.setBigInt64(exports[name].value, BigInt(value), true); };
 
-  // Sweep control → host LFO cycle length in samples (LFO Hz = SR / lfoPeriod).
-  const setLfoPeriod = (samples) => { lfoPeriod = samples; };
-  // Live curve update from the editor (array of CURVE_LEN values in [0,1]).
-  const setCurve = (arr) => { curve = arr; };
+  // Sweep control → cutoff-LFO speed. Writes @cut_lfo_step (entries advanced per
+  // sample); the kernel latches it per voice at note-on, so it sets the speed for
+  // FUTURE notes only. We also shadow it in JS to compute each voice's rate for
+  // the editor playhead (that voice keeps the step it was born with).
+  const setCutStep = (step) => { cutStep = step;
+    if (exports && exports.cut_lfo_step) dv.setFloat64(exports.cut_lfo_step.value, step, true); };
+  // Resample the 128-slot editor curve into the kernel's CUT_TABLE_LEN-entry
+  // @voice_cut_shape table (in linear memory), mapping each [0,1] value onto the
+  // cutoff-coefficient range. One cycle of the looping per-voice LFO; the kernel
+  // wraps the index, so the endpoints should match for a click-free loop.
+  function writeShapeTable() {
+    if (!exports || !exports.voice_cut_shape) return;
+    const base = exports.voice_cut_shape.value / 8;   // f64 index of the table
+    for (let i = 0; i < CUT_TABLE_LEN; i++) {
+      const pos = (i / CUT_TABLE_LEN) * CURVE_LEN;     // fractional curve slot
+      const i0 = Math.floor(pos), t = pos - i0;
+      const a = curve[i0 % CURVE_LEN], b = curve[(i0 + 1) % CURVE_LEN];
+      f64[base + i] = ALPHA_MIN + ALPHA_SPAN * (a * (1 - t) + b * t);
+    }
+  }
+  // Live curve update from the editor (array of CURVE_LEN values in [0,1]): store
+  // it and, if the kernel is loaded, re-fill the shared table so the change
+  // re-voices all live notes at once (each keeps its own phase).
+  const setCurve = (arr) => { curve = arr; writeShapeTable(); };
 
   // --- polyphonic MIDI voices (browser piano) -------------------------------
   // Mirror of the native host's voice allocator: the UI toggles notes, we assign
@@ -257,7 +283,7 @@ function createKernel({ url, blockSamples }) {
   // after consuming it. Events are queued from the UI thread and drained at the top
   // of each render() callback with frame 0 (sub-buffer timing is inaudible here).
   const NUM_VOICES = 8;
-  const voices = Array.from({ length: NUM_VOICES }, () => ({ note: -1, active: false, order: 0 }));
+  const voices = Array.from({ length: NUM_VOICES }, () => ({ note: -1, active: false, order: 0, step: cutStep }));
   let voiceOrder = 0;
   const noteQ = [];
   const noteToHz = (n) => 440 * Math.pow(2, (n - 69) / 12);
@@ -269,7 +295,10 @@ function createKernel({ url, blockSamples }) {
       if (on) {
         let v = voices.findIndex(x => !x.active);
         if (v < 0) { v = 0; for (let i = 1; i < NUM_VOICES; i++) if (voices[i].order < voices[v].order) v = i; }
-        voices[v] = { note, active: true, order: voiceOrder++ };
+        // Record the step this voice latches at note-on (the kernel latches
+        // @cut_lfo_step in lockstep), so its playhead rate is correct even after
+        // the Sweep control is changed for later notes.
+        voices[v] = { note, active: true, order: voiceOrder++, step: cutStep };
         exports._mlir_ciface_set_note_event(BigInt(v), noteToHz(note), 1.0, 0n);
       } else {
         for (let i = 0; i < NUM_VOICES; i++)
@@ -291,54 +320,44 @@ function createKernel({ url, blockSamples }) {
       }
   }
 
-  // Sample the user curve at a fractional phase (0..1 == one cycle) and map its
-  // [0,1] value onto the cutoff-coefficient range. Linearly interpolates between
-  // curve slots and wraps, so any lfoPeriod (faster/slower than one block) works.
-  function sampleCurve(phase) {
-    const pos = (phase - Math.floor(phase)) * CURVE_LEN;
-    const i0 = Math.floor(pos), t = pos - i0;
-    const a = curve[i0 % CURVE_LEN], b = curve[(i0 + 1) % CURVE_LEN];
-    return ALPHA_MIN + ALPHA_SPAN * (a * (1 - t) + b * t);
-  }
-
-  // Stream one block of LFO breakpoints into the kernel's @lfo_bp slots (via
-  // _mlir_ciface_set_value_lfo_breakpoint(value, frame)), then advance the host
-  // phase by one block. The kernel interpolates between the breakpoints and clears
-  // each slot to its -1.0 sentinel as it consumes it. Frame is an i64, so it must
-  // be passed as a BigInt. Mirrors the native host's emitLfoBlock().
-  function emitLfoBlock() {
-    const inc = 1 / lfoPeriod;
-    for (let f = 0; f < blockSamples; f += LFO_BP_STRIDE)
-      exports._mlir_ciface_set_value_lfo_breakpoint(sampleCurve(hostPhase + f * inc), BigInt(f));
-    exports._mlir_ciface_set_value_lfo_breakpoint(
-      sampleCurve(hostPhase + (blockSamples - 1) * inc), BigInt(blockSamples - 1));
-    hostPhase += blockSamples * inc;
-    hostPhase -= Math.floor(hostPhase);
-  }
-
   // Stream `outFloat32.length` samples by invoking the kernel one block at a
   // time — the browser analogue of the native host's fillBlock() render loop.
   // The kernel writes exactly blockSamples per @run call and advances its own
-  // --stream state (voice phases/gates, LMS weights, noise/filter accumulators), so
-  // consecutive calls form one continuous, seam-free stream. Each block first
-  // gets its host-side LFO breakpoints streamed in. The output length must be a
-  // multiple of blockSamples (the audio callback uses a buffer size that is).
+  // --stream state (voice phases/gates + cutoff LFO, LMS weights, noise/filter
+  // accumulators), so consecutive calls form one continuous, seam-free stream. The
+  // output length must be a multiple of blockSamples (the callback's buffer is).
   function render(outFloat32) {
     const base = OUT_PTR / 8;
     drainNotes();                              // apply queued piano note on/offs
     for (let n = 0; n < outFloat32.length; n += blockSamples) {
       bump = ARENA_BASE;                       // fresh arena per block
-      emitLfoBlock();                          // host streams this block's LFO shape
       exports._mlir_ciface_run(DESC_PTR);      // native ABI: pointer to descriptor
       for (let i = 0; i < blockSamples; ++i)
         outFloat32[n + i] = f64[base + i];     // f64 → f32 on copy
     }
   }
 
-  return { load, setParam, setParamI64, setLfoPeriod, setCurve, render,
+  // Editor-playhead source: with per-voice phases there is no single global LFO
+  // position, so we surface EVERY active voice as its own cursor. For each active
+  // slot we read its cutoff-LFO phase [0,1) from @voice_cut_phase in linear memory
+  // and pair it with that voice's latched rate (cycles/sample = step / table len),
+  // so the synth can extrapolate each cursor independently against the audio clock.
+  // Empty array when nothing is playing → no cursors drawn.
+  const getPlayheads = () => {
+    if (!exports || !exports.voice_cut_phase) return [];
+    const base = exports.voice_cut_phase.value / 8;
+    const out = [];
+    for (let v = 0; v < NUM_VOICES; v++) {
+      if (!voices[v].active) continue;
+      const cp = f64[base + v];                       // [0, CUT_TABLE_LEN)
+      out.push({ voice: v, phase: (cp / CUT_TABLE_LEN) % 1, rate: voices[v].step / CUT_TABLE_LEN });
+    }
+    return out;
+  };
+
+  return { load, setParam, setParamI64, setCutStep, setCurve, render,
     queueNote, allNotesOff,             // piano note on/off dispatch to the voice bank
-    getPhase: () => hostPhase,          // generation phase within the LFO cycle [0,1)
-    getRate:  () => 1 / lfoPeriod,      // cycles advanced per sample
+    getPlayheads,                       // per-active-voice cutoff-LFO phase + rate (playheads)
     get loaded() { return !!exports; } };
 }
 
@@ -359,17 +378,19 @@ function createSynth(kernel, { blockSamples, master, warmupBlocks = 0, onTick })
   // multiple of the kernel block, so each callback is an exact number of blocks.
   const BUFFER = 1024;
   let node = null, gain = null, raf = 0;
-  // Playhead anchor: (audio time, LFO phase, rate) captured each callback so the
-  // rAF loop can extrapolate the *audible* phase against the hardware audio clock.
-  let anchorTime = null, anchorPhase = 0, anchorRate = 0;
+  // Playhead anchor: the audio time this buffer becomes audible plus, per active
+  // voice, its {voice, phase, rate} captured each callback so the rAF loop can
+  // extrapolate every *audible* cursor against the hardware audio clock.
+  let anchorTime = null, anchors = [];
 
-  // Audible LFO phase now, in [0,1): linearly extrapolate from the last anchor.
-  // anchorTime is the (future) time this buffer becomes audible, so just after a
-  // callback (now < anchorTime) the phase reads slightly behind the buffer start.
-  function currentPhase() {
-    if (anchorTime == null) return null;
-    const p = anchorPhase + (ctx.currentTime - anchorTime) * anchorRate;
-    return p - Math.floor(p);
+  // Audible LFO phase now for each active voice, in [0,1): linearly extrapolate
+  // each anchor. anchorTime is the (future) time this buffer becomes audible, so
+  // just after a callback (now < anchorTime) each phase reads slightly behind the
+  // buffer start. Empty array when nothing is playing → no cursors.
+  function currentPhases() {
+    if (anchorTime == null) return [];
+    const dt = ctx.currentTime - anchorTime;
+    return anchors.map(a => { const p = a.phase + dt * a.rate; return p - Math.floor(p); });
   }
 
   function start() {
@@ -381,13 +402,12 @@ function createSynth(kernel, { blockSamples, master, warmupBlocks = 0, onTick })
     }
     node = ctx.createScriptProcessor(BUFFER, 0, 1);
     node.onaudioprocess = (e) => {
-      const startPhase = kernel.getPhase();          // phase at the first sample of this buffer
+      const startHeads = kernel.getPlayheads();      // each voice's phase at the first sample
       kernel.render(e.outputBuffer.getChannelData(0));
       // Anchor to the audio clock: this buffer becomes audible ~outputLatency
       // after the callback fires. Rate = cycles/sample × samples/sec = cycles/sec.
-      anchorPhase = startPhase;
-      anchorTime  = ctx.currentTime + (ctx.outputLatency || ctx.baseLatency || 0);
-      anchorRate  = kernel.getRate() * ctx.sampleRate;
+      anchors = startHeads.map(h => ({ phase: h.phase, rate: h.rate * ctx.sampleRate }));
+      anchorTime = ctx.currentTime + (ctx.outputLatency || ctx.baseLatency || 0);
     };
     gain = ctx.createGain();
     const now = ctx.currentTime;
@@ -395,7 +415,7 @@ function createSynth(kernel, { blockSamples, master, warmupBlocks = 0, onTick })
     gain.gain.linearRampToValueAtTime(master, now + 0.03); // click-free fade-in
     node.connect(gain).connect(ctx.destination);
     if (onTick) {
-      const frame = () => { onTick(currentPhase()); raf = requestAnimationFrame(frame); };
+      const frame = () => { onTick(currentPhases()); raf = requestAnimationFrame(frame); };
       raf = requestAnimationFrame(frame);
     }
   }
@@ -405,7 +425,8 @@ function createSynth(kernel, { blockSamples, master, warmupBlocks = 0, onTick })
     if (gain) gain.disconnect();
     node = gain = null;
     anchorTime = null;
-    onTick?.(null);                                  // clear the playhead
+    anchors = [];
+    onTick?.([]);                                    // clear the playheads
   }
   return { start, stop, get playing() { return !!node; } };
 }
@@ -461,7 +482,7 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
   const g = canvas.getContext('2d');
   let userPoints = new Array(length).fill(null);
   let fullCurve  = new Array(length).fill(0.5);
-  let tool = 'draw', drawing = false, mode = 'linear', hoverIdx = -1, playhead = null;
+  let tool = 'draw', drawing = false, mode = 'linear', hoverIdx = -1, playheads = [];
   let visible = true;
 
   const interp = (y1, y2, mu) => {
@@ -522,9 +543,11 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
       g.fillStyle = '#f85149'; g.fill();
       g.strokeStyle = '#fff'; g.lineWidth = 1; g.stroke();
     }
-    // Playback cursor: the audible LFO position within the cycle (phase 0..1).
-    if (playhead != null) {
-      const px = playhead * canvas.width;
+    // Playback cursors: one per active voice, each at that voice's own audible LFO
+    // position within the cycle (phase 0..1). They share the shape but sweep it at
+    // their own trigger-anchored phase and latched rate.
+    for (const phase of playheads) {
+      const px = phase * canvas.width;
       g.beginPath(); g.strokeStyle = '#d29922'; g.lineWidth = 1.5;
       g.moveTo(px, 0); g.lineTo(px, canvas.height); g.stroke();
     }
@@ -575,14 +598,14 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
   for (const b of Object.values(buttons)) b.disabled = false;
   interpSelect.disabled = false;
   loadTriangle();
-  // Move the playback cursor (phase in [0,1), or null to hide) and redraw. When
-  // hidden this is a cheap no-op (render() early-returns), so the per-frame draw
-  // overhead disappears while the audio keeps streaming.
-  const setPlayhead = (phase) => { playhead = phase; render(); };
+  // Move the playback cursors (array of phases in [0,1), one per active voice; empty
+  // to hide) and redraw. When hidden this is a cheap no-op (render() early-returns),
+  // so the per-frame draw overhead disappears while the audio keeps streaming.
+  const setPlayheads = (phases) => { playheads = phases; render(); };
   // Gate the canvas redraws (the DOM show/hide is handled by the caller). When
   // false, render() is a no-op so the per-frame draw overhead disappears.
   const setVisible = (v) => { visible = v; if (v) render(); };
-  return { getCurve: () => [...fullCurve], setPlayhead, setVisible };
+  return { getCurve: () => [...fullCurve], setPlayheads, setVisible };
 }
 
 // ---- LMS adaptive noise canceller kernel ----------------------------------
@@ -597,7 +620,8 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
   const sweepVal = document.getElementById('sweepVal');
 
   // LFO shape editor: pushes its 128-slot [0,1] curve into the kernel live; the
-  // kernel maps it to the cutoff range and streams it as mode-B breakpoints.
+  // host resamples it into the shared @voice_cut_shape table (mapped to the cutoff
+  // range), which every voice reads at its own trigger-anchored phase.
   const editor = createCurveEditor({
     canvas: document.getElementById('curve'),
     output: document.getElementById('curveOut'),
@@ -628,7 +652,7 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
   // persistent LMS weights adapt before the first audible sample. onTick drives
   // the editor's playback cursor from the audio-clock-anchored LFO phase.
   const synth = createSynth(kernel, { blockSamples: BLOCK, master: 0.25, warmupBlocks: 64,
-    onTick: (phase) => editor.setPlayhead(phase) });
+    onTick: (phases) => editor.setPlayheads(phases) });
 
   // @mu (LMS step size) is left at its compiled default (1e-3, from lms-noise.mlir):
   // small enough that the weights converge over the first few blocks and stay put.
@@ -641,26 +665,27 @@ function createCurveEditor({ canvas, output, length, buttons, interpSelect, onCh
       { el: kind, apply: () => kernel.setParamI64('noise_kind', +kind.value) },
       { el: wet,  apply: () => { const w = +wet.value; wetVal.textContent = w.toFixed(2);
         kernel.setParam('wet', w); } },
-      // Sweep sets the host LFO cycle length in samples (LFO Hz = SR / period); the
-      // host streams the triangle breakpoints each block (mode B), so no kernel global.
+      // Sweep sets the per-voice cutoff-LFO speed via @cut_lfo_step (entries/sample;
+      // LFO Hz = SR * step / table length). The kernel latches it at each note-on,
+      // so a change here sets the speed for notes played afterwards, not live ones.
       { el: sweep, apply: () => { const hz = +sweep.value; sweepVal.textContent = `${hz.toFixed(2)} Hz`;
-        kernel.setLfoPeriod(Math.round(SR / hz)); } },
+        kernel.setCutStep(hz * CUT_TABLE_LEN / SR); } },
     ],
   });
 
   // --- on-screen piano (MIDI-triggered voices) ------------------------------
-  // One octave C4..C5. Each key carries its computer-key letter as a caption and
+  // One octave C3..C4. Each key carries its computer-key letter as a caption and
   // maps to the same letters as the native driver's emulated keyboard. A key
   // TOGGLES its note (press = ON, press again = OFF); clicking or pressing the
   // letter both route through toggleNote(). The lit key reflects the note state.
   const PIANO_KEYS = [
-    { note: 60, key: 'a', black: false }, { note: 61, key: 'w', black: true  },
-    { note: 62, key: 's', black: false }, { note: 63, key: 'e', black: true  },
-    { note: 64, key: 'd', black: false }, { note: 65, key: 'f', black: false },
-    { note: 66, key: 't', black: true  }, { note: 67, key: 'g', black: false },
-    { note: 68, key: 'y', black: true  }, { note: 69, key: 'h', black: false },
-    { note: 70, key: 'u', black: true  }, { note: 71, key: 'j', black: false },
-    { note: 72, key: 'k', black: false },
+    { note: 48, key: 'a', black: false }, { note: 49, key: 'w', black: true  },
+    { note: 50, key: 's', black: false }, { note: 51, key: 'e', black: true  },
+    { note: 52, key: 'd', black: false }, { note: 53, key: 'f', black: false },
+    { note: 54, key: 't', black: true  }, { note: 55, key: 'g', black: false },
+    { note: 56, key: 'y', black: true  }, { note: 57, key: 'h', black: false },
+    { note: 58, key: 'u', black: true  }, { note: 59, key: 'j', black: false },
+    { note: 60, key: 'k', black: false },
   ];
   const WHITE_TOTAL = PIANO_KEYS.filter(k => !k.black).length;  // 8 white keys
   const keyEls = {};                       // note -> key element (for the lit highlight)

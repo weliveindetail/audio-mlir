@@ -91,6 +91,41 @@ module {
   memref.global "public" @voice_ev_frame : memref<8xi64> = dense<128>
   memref.global "public" @voice_ev_gate  : memref<8xf64> = dense<0.000000e+00>
   memref.global "public" @voice_ev_freq  : memref<8xf64> = dense<0.000000e+00>
+  // Per-voice CUTOFF envelope + FILTER state (the per-voice, trigger-anchored
+  // low-pass -- see samples/notes.md "Per-voice, trigger-anchored cutoff").
+  //   @voice_cut_phase : samples since this voice's last note-on, one slot per
+  //     voice, carried across blocks. @run resets it to 0 at the EXACT trigger
+  //     frame (sample-tight) and counts up, WRAPPING at the table length L, so the
+  //     shape LOOPS as a continuous per-voice cutoff LFO (not a one-shot attack).
+  //     The wrap is anchored at each voice's own trigger, so the voices' relative
+  //     phases are preserved. Init 0 (an untriggered voice is silent anyway).
+  //   @voice_lp_state  : the per-voice one-pole low-pass state y[n-1], continuous
+  //     across blocks, reset to 0 at a note-on so a stolen voice starts a fresh
+  //     filter instead of inheriting the previous note's tail.
+  memref.global "public" @voice_cut_phase : memref<8xf64> = dense<0.000000e+00>
+  memref.global "public" @voice_lp_state  : memref<8xf64> = dense<0.000000e+00>
+  //   @voice_cut_step  : the cutoff-LFO speed LATCHED per voice at its note-on,
+  //     one slot per voice, carried across blocks. @run copies the current global
+  //     @cut_lfo_step into this slot only at a note-on, so a live speed change
+  //     affects ONLY notes triggered after it -- already-sounding voices keep the
+  //     speed they were born with. Init matches @cut_lfo_step's default.
+  memref.global "public" @voice_cut_step  : memref<8xf64> = dense<1.000000e+00>
+  // Shared cutoff-SHAPE table: the one-pole coefficient alpha as a function of
+  // samples-since-trigger, ONE entry per sample of the sweep (table index == the
+  // voice's WRAPPING @voice_cut_phase, so the shape repeats as a looping LFO).
+  // Every voice reads THIS one table at its own phase, so (a) editing the table --
+  // the host writes voice_cut_shape[] -- re-voices all live notes at once, while
+  // (b) each voice keeps its own trigger-anchored phase and therefore its own
+  // position in the cycle. The host fills a PERIODIC curve (equal at both ends) so
+  // the wrap is click-free. Init is a splat; the host fills the real curve at
+  // start-up (its SHAPE is a WebUI control for now).
+  memref.global "public" @voice_cut_shape : memref<8000xf64> = dense<3.500000e-01>
+  // Cutoff-LFO speed for NEW voices: how many table entries a voice's phase
+  // advances per sample. LFO Hz = SAMPLE_RATE * step / L (L=8000): step 1 => ~5.5
+  // Hz. The host sets this live from the +/- keys, but @run only LATCHES it into a
+  // voice's @voice_cut_step at that voice's note-on, so changing it re-speeds only
+  // notes triggered afterwards -- already-sounding voices keep their latched speed.
+  memref.global "public" @cut_lfo_step : memref<f64> = dense<1.000000e+00>
   // Per-block scratch the voice loop sums into, then bridges to tensor land via
   // dsp.fromGlobal (no to_tensor hook in this toolchain). Private.
   memref.global "private" @voice_mix : memref<128xf64> = dense<0.000000e+00>
@@ -218,11 +253,6 @@ module {
     %n01 = "dsp.add"(%p0, %p1) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
     %n0  = "dsp.add"(%n01, %p2) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
 
-    // %ones (a constant-1 vector) is used by the LFO section further down; the
-    // tone that used to be here is now the polyphonic voice bank below.
-    %one1  = dsp.constant dense<1.000000e+00> : tensor<f64>
-    %ones  = "dsp.getRangeOfVector"(%one1, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-
     // --- polyphonic MIDI-triggered sawtooth voices (replaces the continuous
     //     440 Hz tone) -------------------------------------------------------
     // Design in one place: a FIXED bank of 8 voices, each an independent naive
@@ -259,16 +289,34 @@ module {
     %egM   = memref.get_global @voice_ev_gate  : memref<8xf64>
     %erM   = memref.get_global @voice_ev_freq  : memref<8xf64>
     %mixM  = memref.get_global @voice_mix      : memref<128xf64>
+    // per-voice cutoff-envelope constants (the LFO is gone; each voice reads its
+    // alpha from the shared @voice_cut_shape table at its own trigger-anchored
+    // phase, so all voices share one shape but keep independent positions).
+    %vL     = arith.constant 8.000000e+03 : f64   // shape-table length; cp wraps here
+    %vcpM   = memref.get_global @voice_cut_phase : memref<8xf64>
+    %vlpM   = memref.get_global @voice_lp_state  : memref<8xf64>
+    %vcsM   = memref.get_global @voice_cut_shape : memref<8000xf64>
+    %vcstM  = memref.get_global @voice_cut_step  : memref<8xf64>
+    // current cutoff-LFO speed for NEW voices, read once per block; only latched
+    // into a voice's own @voice_cut_step at its note-on (see the loop below).
+    %vstepM = memref.get_global @cut_lfo_step : memref<f64>
+    %vstepNew = memref.load %vstepM[] : memref<f64>
     // clear the mix accumulator for this block
     affine.for %z = 0 to 128 {
       memref.store %vzero, %mixM[%z] : memref<128xf64>
     }
-    // sum the 8 voices into @voice_mix
+    // sum the 8 voices into @voice_mix, each low-passed by its OWN cutoff envelope
+    // anchored sample-accurately at that voice's trigger frame (option A of the
+    // notes.md voice-bank options: the per-voice one-pole is an extra iter_arg,
+    // the cutoff envelope another per-voice phase carried across blocks).
     affine.for %v = 0 to 8 {
       %freq0 = memref.load %vfM[%v] : memref<8xf64>
       %ph0   = memref.load %vpM[%v] : memref<8xf64>
       %g0    = memref.load %vgM[%v] : memref<8xf64>
       %tgt0  = memref.load %vtM[%v] : memref<8xf64>
+      %cph0  = memref.load %vcpM[%v] : memref<8xf64>
+      %ylp0  = memref.load %vlpM[%v] : memref<8xf64>
+      %vst0  = memref.load %vcstM[%v] : memref<8xf64>
       %efrI  = memref.load %efM[%v] : memref<8xi64>
       %eg    = memref.load %egM[%v] : memref<8xf64>
       %ef    = memref.load %erM[%v] : memref<8xf64>
@@ -281,9 +329,19 @@ module {
       %freqE = arith.select %isOn, %ef, %freq0 : f64
       %phSt  = arith.select %isOn, %vzero, %ph0 : f64
       %inc   = arith.mulf %freqE, %vdt : f64
-      %res:2 = affine.for %sn = 0 to 128 iter_args(%gp = %g0, %pp = %phSt) -> (f64, f64) {
+      // note-on LATCHES the current global speed for this voice; else keep the
+      // speed it was born with, so a live @cut_lfo_step change affects only new
+      // notes. Block-level like %freqE: the gate mutes any pre-trigger portion.
+      %stepE = arith.select %isOn, %vstepNew, %vst0 : f64
+      %res:4 = affine.for %sn = 0 to 128
+               iter_args(%gp = %g0, %pp = %phSt, %cp = %cph0, %yp = %ylp0)
+               -> (f64, f64, f64, f64) {
         %ni  = arith.index_cast %sn : index to i64
         %nf  = arith.sitofp %ni : i64 to f64
+        // is this the EXACT trigger frame of a note-on? (the sample-tight anchor
+        // for both the cutoff envelope reset and the filter-state reset below)
+        %onFr  = arith.cmpf oeq, %nf, %efrF : f64
+        %atTrg = arith.andi %onFr, %isOn : i1
         // gate target: old target before the event frame, new target from it on
         %pre = arith.cmpf olt, %nf, %efrF : f64
         %tgt = arith.select %pre, %tgt0, %eg : f64
@@ -298,174 +356,55 @@ module {
         %pw  = arith.select %pge, %ps, %pr : f64
         %s2  = arith.mulf %vtwo, %pw : f64
         %saw = arith.subf %s2, %vone : f64
-        // mix += saw * gate * per-voice gain
-        %sg  = arith.mulf %saw, %gn : f64
+        // per-voice cutoff LFO phase: resets to 0 at the exact trigger frame, then
+        // advances by this voice's latched speed (%stepE) each sample and WRAPS at
+        // the table length L, so the shape loops continuously at that rate.
+        %cpA   = arith.addf %cp, %stepE : f64
+        %cpR   = arith.select %atTrg, %vzero, %cpA : f64
+        %cpGeL = arith.cmpf oge, %cpR, %vL : f64
+        %cpW   = arith.subf %cpR, %vL : f64
+        %cpC   = arith.select %cpGeL, %cpW, %cpR : f64
+        // alpha = shared shape table at this voice's trigger-anchored, wrapping
+        // index. The table is host-filled and shared by every voice, so an edit
+        // re-voices all live notes while each keeps its own cp (its own phase).
+        %cpI   = arith.fptosi %cpC : f64 to i64
+        %cpIdx = arith.index_cast %cpI : i64 to index
+        %alpha = memref.load %vcsM[%cpIdx] : memref<8000xf64>
+        // per-voice one-pole low-pass on the saw; state reset at the trigger:
+        // y[n] = (1-alpha)*y[n-1] + alpha*saw
+        %oma   = arith.subf %vone, %alpha : f64
+        %ypR   = arith.select %atTrg, %vzero, %yp : f64
+        %lpA   = arith.mulf %oma, %ypR : f64
+        %lpB   = arith.mulf %alpha, %saw : f64
+        %yn    = arith.addf %lpA, %lpB : f64
+        // mix += filtered * gate * per-voice gain
+        %sg  = arith.mulf %yn, %gn : f64
         %sgv = arith.mulf %sg, %vgain : f64
         %cur = memref.load %mixM[%sn] : memref<128xf64>
         %acc = arith.addf %cur, %sgv : f64
         memref.store %acc, %mixM[%sn] : memref<128xf64>
-        affine.yield %gn, %pw : f64, f64
+        affine.yield %gn, %pw, %cpC, %yn : f64, f64, f64, f64
       }
       // persist per-voice state; commit the pending target; consume the event
       memref.store %res#0, %vgM[%v] : memref<8xf64>
       memref.store %res#1, %vpM[%v] : memref<8xf64>
+      memref.store %res#2, %vcpM[%v] : memref<8xf64>
+      memref.store %res#3, %vlpM[%v] : memref<8xf64>
+      memref.store %stepE, %vcstM[%v] : memref<8xf64>
       memref.store %freqE, %vfM[%v] : memref<8xf64>
       %tgtN = arith.select %hasEv, %eg, %tgt0 : f64
       memref.store %tgtN, %vtM[%v] : memref<8xf64>
       memref.store %vN, %efM[%v] : memref<8xi64>
     }
-    %saw = "dsp.fromGlobal"() {global = @voice_mix} : () -> tensor<128xf64>
-
-    // --- automated low-pass on the tone: cutoff swept by a slow in-kernel LFO ---
-    // The cutoff coefficient alpha is now materialised PER SAMPLE as a
-    // tensor<128xf64> (a smooth in-block sweep) rather than one control-rate
-    // value held for the whole block. The LFO is a phase accumulator -- the
-    // "phase-mode interpolation" of the @lfo_period parameter: from the running
-    // phase phase0 and the held period P0 we build phase[n] = phase0 + n/P0,
-    // wrap to [0,1), and map a triangle to alpha[n] = 0.02 + 0.33*tri[n].
-    // dsp.lowPassFilter now consumes this per-sample (rank-1) alpha; it still
-    // carries --stream state (its previous output), so the tone is continuous
-    // across calls. Applied to the sawtooth (the signal path), so the sweep is
-    // an audible timbral change. Built entirely from tensor ops (getRangeOfVector
-    // ramp, modulo wrap, abs for |2f-1|), so it stays in tensor land.
-    %one1f  = arith.constant 1.000000e+00 : f64
-    %blkf   = arith.constant 1.280000e+02 : f64          // N (block size)
-    // held/current period P0 and the running LFO phase at block start.
-    %lpPmem = memref.get_global @lfo_period : memref<i64>
-    %lpP    = memref.load %lpPmem[] : memref<i64>
-    %lpPf   = arith.sitofp %lpP : i64 to f64
-    %phmem  = memref.get_global @lfo_phase : memref<f64>
-    %phase0 = memref.load %phmem[] : memref<f64>         // phase at start of block
-    // per-sample phase increment incHeld = 1/P0 (cycles per sample), then
-    // phase[n] = phase0 + n*incHeld as a tensor, wrapped to [0,1).
-    %incH   = arith.divf %one1f, %lpPf : f64
-    %incHt  = tensor.from_elements %incH   : tensor<f64>
-    %ph0t   = tensor.from_elements %phase0 : tensor<f64>
-    %phRamp = "dsp.getRangeOfVector"(%ph0t, %cnt, %incHt) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    %phW    = "dsp.modulo"(%phRamp, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    // triangle tri[n] = 1 - |2*phase - 1|  (0 at edges, 1 at centre), per sample.
-    %ph2    = "dsp.add"(%phW, %phW) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    %ph2m1  = "dsp.sub"(%ph2, %ones) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    %phAbs  = "dsp.abs"(%ph2m1) : (tensor<128xf64>) -> tensor<128xf64>
-    %triV   = "dsp.sub"(%ones, %phAbs) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    // alphaKernel[n] = 0.02 + 0.33 * tri[n]  -> in [0.02, 0.35], per sample. This
-    // is Mode A (kernel-side LFO). Mode B replaces it with a host-streamed shape.
-    %c033   = dsp.constant dense<3.300000e-01> : tensor<f64>   // span -> up to ~0.35 (bright)
-    %c002   = dsp.constant dense<2.000000e-02> : tensor<f64>   // muffled floor (~140 Hz)
-    %spanV  = "dsp.getRangeOfVector"(%c033, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    %aminV  = "dsp.getRangeOfVector"(%c002, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    %amodV  = "dsp.mul"(%triV, %spanV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    %alphaKV = "dsp.add"(%amodV, %aminV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-
-    // --- Mode B: HOST-side LFO (breakpoint-envelope interpolation) ------------
-    // The host streams a sparse shape into @lfo_bp (slot == frame, empty == -1.0
-    // sentinel). We fill a per-sample alpha by piecewise-LINEAR interpolation
-    // between the occupied slots -- a scan that pure tensor ops can't express (no
-    // elementwise select / prefix), so it is a hand-written affine.for pair
-    // writing memrefs, bridged back to tensor land by dsp.fromGlobal. For a
-    // triangle this reproduces Mode A exactly (a triangle IS piecewise-linear);
-    // for any other breakpoint set it draws an arbitrary shape.
-    %sent   = arith.constant -1.000000e+00 : f64                // "no anchor here"
-    %c127i  = arith.constant 127 : index
-    %bpMem  = memref.get_global @lfo_bp : memref<128xf64>
-    %rvMem  = memref.get_global @lfo_rv : memref<128xf64>
-    %rfMem  = memref.get_global @lfo_rf : memref<128xf64>
-    %ahMem  = memref.get_global @lfo_alpha_host : memref<128xf64>
-    %acMem  = memref.get_global @lfo_alpha_carry : memref<f64>
-    %carry0 = memref.load %acMem[] : memref<f64>                 // alpha at end of prev block
-    // Backward pass: for each sample n (127..0) record the nearest anchor
-    // at-or-after it -- value into @lfo_rv, frame into @lfo_rf (128.0 == none).
-    %rv0 = arith.constant 0.000000e+00 : f64
-    %rf0 = arith.constant 1.280000e+02 : f64
-    affine.for %i = 0 to 128 iter_args(%rvAcc = %rv0, %rfAcc = %rf0) -> (f64, f64) {
-      %nb    = arith.subi %c127i, %i : index
-      %nib   = arith.index_cast %nb : index to i64
-      %nfb   = arith.sitofp %nib : i64 to f64
-      %bvb   = memref.load %bpMem[%nb] : memref<128xf64>
-      %isbpb = arith.cmpf one, %bvb, %sent : f64
-      %rvN   = arith.select %isbpb, %bvb, %rvAcc : f64
-      %rfN   = arith.select %isbpb, %nfb, %rfAcc : f64
-      memref.store %rvN, %rvMem[%nb] : memref<128xf64>
-      memref.store %rfN, %rfMem[%nb] : memref<128xf64>
-      affine.yield %rvN, %rfN : f64, f64
-    }
-    // Forward pass: carry the nearest anchor at-or-before (pv,pf); interpolate to
-    // the right anchor (rv,rf); hold when there is none ahead (rf==128) or we sit
-    // exactly on an anchor (denom==0). Reset each consumed slot to the sentinel.
-    // The 3rd iter_arg carries the last alpha so we can store the block-end value.
-    %pf0 = arith.constant 0.000000e+00 : f64
-    %maxfr = arith.constant 1.280000e+02 : f64
-    %la:3 = affine.for %m = 0 to 128 iter_args(%pv = %carry0, %pf = %pf0, %laAcc = %carry0) -> (f64, f64, f64) {
-      %mi    = arith.index_cast %m : index to i64
-      %mf    = arith.sitofp %mi : i64 to f64
-      %bvf   = memref.load %bpMem[%m] : memref<128xf64>
-      %isbpf = arith.cmpf one, %bvf, %sent : f64
-      %pvN   = arith.select %isbpf, %bvf, %pv : f64
-      %pfN   = arith.select %isbpf, %mf, %pf : f64
-      %rv    = memref.load %rvMem[%m] : memref<128xf64>
-      %rf    = memref.load %rfMem[%m] : memref<128xf64>
-      %denom = arith.subf %rf, %pfN : f64
-      %none  = arith.cmpf oge, %rf, %maxfr : f64                 // no anchor ahead
-      %zeroD = arith.cmpf oeq, %denom, %pf0 : f64                // denom == 0
-      %hold  = arith.ori %none, %zeroD : i1
-      %safeD = arith.select %hold, %one1f, %denom : f64          // avoid div-by-zero
-      %dv    = arith.subf %rv, %pvN : f64
-      %slope = arith.divf %dv, %safeD : f64
-      %dn    = arith.subf %mf, %pfN : f64
-      %step  = arith.mulf %dn, %slope : f64
-      %interp = arith.addf %pvN, %step : f64
-      %alpha = arith.select %hold, %pvN, %interp : f64
-      memref.store %alpha, %ahMem[%m] : memref<128xf64>
-      memref.store %sent, %bpMem[%m] : memref<128xf64>           // consume: reset slot
-      affine.yield %pvN, %pfN, %alpha : f64, f64, f64
-    }
-    memref.store %la#2, %acMem[] : memref<f64>                   // carry block-end alpha
-    %alphaHV = "dsp.fromGlobal"() {global = @lfo_alpha_host} : () -> tensor<128xf64>
-
-    // --- blend by mode: alpha = (1-m)*alphaKernel + m*alphaHost, m in {0,1} ---
-    %mdMem  = memref.get_global @lfo_mode : memref<i64>
-    %mdI    = memref.load %mdMem[] : memref<i64>
-    %mdF    = arith.sitofp %mdI : i64 to f64
-    %omF    = arith.subf %one1f, %mdF : f64
-    %mdT    = tensor.from_elements %mdF : tensor<f64>
-    %omT    = tensor.from_elements %omF : tensor<f64>
-    %mdV    = "dsp.getRangeOfVector"(%mdT, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    %omV    = "dsp.getRangeOfVector"(%omT, %cnt, %zero) : (tensor<f64>, tensor<f64>, tensor<f64>) -> tensor<128xf64>
-    %aKw    = "dsp.mul"(%alphaKV, %omV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    %aHw    = "dsp.mul"(%alphaHV, %mdV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    %alphaV = "dsp.add"(%aKw, %aHw) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-    %tone   = "dsp.lowPassFilter"(%saw, %alphaV) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>
-
-    // --- advance the LFO phase, honouring the timestamped @lfo_period change ---
-    // A pending change (scheduled by @set_value_lfo_period with a frame
-    // timestamp) takes effect at frame f within THIS block: the phase advances at
-    // the held rate 1/P0 for f samples and the pending rate 1/Pp for the
-    // remaining N-f, so the exact event frame is reflected in the carried phase
-    // (sample-accurate), even though the within-block alpha ramp above uses the
-    // held period (the pending period becomes the ramp slope from next block).
-    // f == N (=128) means "no pending change" (advance = N/P0, as before).
-    // Advancing only the increment (not re-deriving phase from a counter) keeps
-    // sweep-speed changes click-free.
-    %ppMem  = memref.get_global @lfo_period_pending : memref<i64>
-    %ppI    = memref.load %ppMem[] : memref<i64>
-    %ppF    = arith.sitofp %ppI : i64 to f64
-    %frMem  = memref.get_global @lfo_period_frame : memref<i64>
-    %frI    = memref.load %frMem[] : memref<i64>
-    %frF    = arith.sitofp %frI : i64 to f64
-    %incP   = arith.divf %one1f, %ppF : f64              // 1/pending
-    %nMinF  = arith.subf %blkf, %frF : f64               // N - f
-    %advH   = arith.mulf %frF, %incH : f64               // f/P0
-    %advP   = arith.mulf %nMinF, %incP : f64             // (N-f)/pending
-    %adv    = arith.addf %advH, %advP : f64
-    %phraw  = arith.addf %phase0, %adv : f64
-    %phge1  = arith.cmpf oge, %phraw, %one1f : f64       // inc<1 so one subtract suffices
-    %phsub  = arith.subf %phraw, %one1f : f64
-    %phnext = arith.select %phge1, %phsub, %phraw : f64  // wrap to [0,1)
-    memref.store %phnext, %phmem[] : memref<f64>
-    // commit: held := pending, and mark the event consumed (frame := N).
-    memref.store %ppI, %lpPmem[] : memref<i64>
-    %blkI   = arith.constant 128 : i64
-    memref.store %blkI, %frMem[] : memref<i64>
+    // The voice mix now already holds the per-voice-FILTERED, gated sum: each
+    // voice was low-passed inside the loop above by its own cutoff envelope,
+    // anchored sample-accurately at that voice's trigger frame. So the summed
+    // signal IS the tone -- there is no post-sum, global low-pass and no in-kernel
+    // LFO any more (the old rank-1 dsp.lowPassFilter + phase-accumulator LFO +
+    // Mode-B breakpoint interpolator are all gone). The @lfo_* globals and the
+    // @set_value_lfo_* setters are retained, inert, only so the existing host
+    // still links; @run ignores them in this per-voice-cutoff variant.
+    %tone = "dsp.fromGlobal"() {global = @voice_mix} : () -> tensor<128xf64>
 
     // --- desired d[n] = tone + colored noise ---
     %d = "dsp.add"(%tone, %n0) : (tensor<128xf64>, tensor<128xf64>) -> tensor<128xf64>

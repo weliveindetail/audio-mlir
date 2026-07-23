@@ -181,9 +181,64 @@ they preserve the optimiser:
      `@set_*`/`@run` funcs survive; only internally-called helpers are inlined away.)
   3. *A batched `tensor<VxNxf64>` voice dimension* -- one op over all voices; needs dialect
      work (rank-2 variants of the oscillator/gate ops) but is the cleanest long-term.
-  4. *A first-class stateful `dsp.osc`/`dsp.voice` scan op* -- folds phase+gate recurrence
-     into one op that `StreamStateMaterialization` gives per-instance state (the "shared
-     scan primitive" direction in the feedforward/feedback section below).
+  4. *A first-class stateful `dsp.osc`/`dsp.voice` scan op* -- folds the phase, gate AND
+     per-voice cutoff-filter recurrences into one op that `StreamStateMaterialization` gives
+     per-instance state (the "shared scan primitive" direction in the feedforward/feedback
+     section below). See "Per-voice, trigger-anchored cutoff" below for what it must own.
+
+**Per-voice, trigger-anchored cutoff (the requirement that tips this to option 4).** The
+original low-pass sat on the *summed* saw (rank-1, one `dsp.lowPassFilter` with a single
+`memref<1xf64>` carry). Moving the cutoff *per voice* -- each note filtered by its own
+envelope, anchored sample-accurately at that note's trigger frame -- pushes the filter
+*before* the sum and reshapes the problem:
+  * The one-pole becomes a **rank-2 (batched) scan** `y[v,n] = (1-a[v,n])*y[v,n-1] +
+    a[v,n]*x[v,n]`, with **per-voice filter state** (`memref<Vxf64>`, not `memref<1xf64>`)
+    that must be **reset on note-on / voice-steal** so the previous note's filter tail does
+    not bleed into a stolen voice.
+  * The cutoff coefficient `a` stops being a global LFO and becomes a **per-voice envelope
+    whose time origin is that voice's note-on** -- structurally the same object as the
+    per-voice oscillator phase (a batched, trigger-anchored time base). It is closed-form
+    (feedforward), so it needs a batched ramp/envelope plus one more per-voice state slot
+    (`@voice_cut_phase`, the samples-since-trigger counter) carried across blocks and reset
+    to 0 at the exact event frame.
+  * **Sample-tight** anchoring means the envelope and the filter-state reset key off
+    `ev_frame`, not block start -- so the gate, the cutoff envelope, and the filter reset are
+    all sample-accurate, while the oscillator phase is still block-granular; a fully
+    consistent voice would move phase to `ev_frame` too.
+
+`samples/lms-noise.mlir` now prototypes this as **option A** (hand-rolled): the per-voice
+one-pole is an extra `iter_arg` in the sample loop, the cutoff envelope another per-voice
+phase global (`@voice_cut_phase` / `@voice_lp_state`), and the in-kernel + host LFO are
+dropped (the `@lfo_*` globals and `@set_value_lfo_*` setters are retained inert only so the
+existing host still links). It validates the behaviour but stays opaque to fusion/Axis-B.
+
+**Missing pieces for option 4 (a first-class stateful `dsp.voice` scan op).** The per-voice
+cutoff requirement makes option 4 the natural home, because every per-voice, trigger-anchored,
+block-carried quantity is then one op's state:
+  1. **ODS.** `def VoiceOp : Dsp_Op<"voice", ...>` taking rank-1 per-voice control vectors
+     (`freq`, and the timestamped event triple `ev_frame`/`ev_gate`/`ev_freq` as
+     `tensor<Vxi64>`/`tensor<Vxf64>`) plus scalar params (`dt`, gate rate, cutoff span/floor/
+     length), producing `tensor<VxNxf64>` (or a pre-summed `tensor<Nxf64>`). `V`/`N` come from
+     the operand/result types.
+  2. **State.** Four per-voice recurrences -- oscillator phase, smoothed gate, cutoff-envelope
+     phase, and the one-pole filter -- so the op carries a `memref<Vx4xf64>` (or four
+     `memref<Vxf64>`) state block. `StreamStateMaterialization` already gives each stateful op
+     instance its own global; the new work is sizing it `V`-wide and threading it via the op's
+     `state` attr the way `dsp.lowPassFilter`/`dsp.lmsFilterResponse` do today.
+  3. **Lowering.** A `ConversionPattern` emitting the voice-outer / sample-inner nest that is
+     exactly the option-A prototype loop, but reading per-voice params from operands and state
+     from the materialized global. The trigger anchor is a compare against the op's own
+     `ev_frame` operand -- the op owns the event, so sample-tight cutoff is intrinsic.
+  4. **Reduction.** Either fold the V-sum into the lowering (emit `tensor<Nxf64>` directly) or
+     pair the `tensor<VxNxf64>` result with a new **reduce-over-axis** op (`dsp.sum` collapses
+     *all* elements to a scalar, so it cannot collapse just `V`).
+  5. **Tests.** State globals materialized per op, sample-accurate note-on (gate + cutoff both
+     key off `ev_frame`), filter-state reset on steal, and continuity of all four recurrences
+     across `--stream` blocks.
+
+Option 3 (batched tensors) and option 4 share primitives: option 3 needs a rank-2
+`getRangeOfVector` (per-row `first`/`step`) and a rank-2 `lowPassFilter`; option 4 folds both,
+plus the gate and trigger logic, into one op. The reduce-over-axis op is needed by both.
 
 **Prototype limitations (v1).** One pending event per voice per block (the host allocator
 must not target a voice twice in one block); `@set_note_event` must be called only from the

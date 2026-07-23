@@ -21,8 +21,12 @@
 //                                       (0 = noise back in, 1 = clean tone).
 //   Left / Right arrows -> @noise_kind: cycle the noise color (white/pink/brown/
 //                                       ou/none), the live dsp.index_switch case.
-//   + / - keys          -> @lfo_period: the cutoff-sweep automation speed
-//                                       (+ faster / - slower).
+//   + / - keys          -> @cut_lfo_step: the cutoff-LFO SPEED for NEW voices
+//                                       (+ faster / - slower, shown in Hz). Latched
+//                                       per voice at note-on, so it only affects
+//                                       notes triggered afterwards; already-sounding
+//                                       voices are unchanged. (The wah SHAPE is a
+//                                       WebUI control for now.)
 //
 // The noise reference is generated in-kernel from an LCG stream (the same math
 // the dsp.noise_* dialect ops encode); no RNG primitive or host-fed data is
@@ -57,31 +61,33 @@ extern "C" double wet;        // @wet: how much of the noise estimate to subtrac
 // (memref<i64> in the kernel) rather than a float knob like @mu / @wet.
 extern "C" int64_t noise_kind;
 
-// @lfo_period: the cutoff-sweep LFO period in samples (the automation *speed*).
-// Smaller = faster sweep. This parameter is no longer a directly-written global:
-// the kernel now exposes a *timestamped setter*, @set_value_lfo_period(value,
-// frame), and interpolates the change via its phase accumulator (see the
-// lms-noise.mlir header). The host schedules a new value with a frame offset
-// into the next block; here the +/- keys apply at frame 0 (start of next block).
-// We keep a host-side shadow of the current value purely for the status display.
-extern "C" void _mlir_ciface_set_value_lfo_period(int64_t value, int64_t frame);
-static int64_t gLfoPeriod = 147000; // mirrors the kernel's @lfo_period default
+// @voice_cut_shape: the SHARED per-voice cutoff-sweep shape. It is a plain array
+// global (memref<8000xf64>), so the host reaches it directly as this symbol --
+// no setter needed, unlike the scalar-parameter knobs. Entry i is the one-pole
+// coefficient alpha a voice uses when its phase is at table index i; the kernel
+// WRAPS that phase at L, so the table is one cycle of a looping cutoff LFO. It
+// must be PERIODIC (entry 0 ~= entry L-1) for the wrap to be click-free: the
+// default filled below is a triangle wah, bright at the wrap and dark mid-cycle.
+// Every voice indexes the SAME table at its own @voice_cut_phase, so the SHAPE is
+// a global control (the WebUI will drive it live; this host just fills a fixed
+// default at start-up). What THIS host varies live is the sweep SPEED, below.
+constexpr int    CUT_SHAPE_LEN  = 8000;         // MUST match the kernel memref<8000xf64>
+extern "C" double voice_cut_shape[CUT_SHAPE_LEN];
+constexpr double CUT_ALPHA_MIN  = 0.02;         // muffled floor (dip of the wah)
+constexpr double CUT_ALPHA_SPAN = 0.33;         // bright(0.35) - muffled(0.02)
+constexpr double CUT_SHARPNESS  = 1.0;          // fixed wah sharpness (1 == triangle)
 
-// @lfo_mode: who computes the cutoff-sweep. 0 = KERNEL-side (the kernel's own
-// phase-accumulator triangle), 1 = HOST-side (this program computes an arbitrary
-// sweep SHAPE and streams it into the kernel as per-sample breakpoints). Toggled
-// with the 'M' key. Mode B is the "heavy parameter traffic" path: each rendered
-// block the host fires a burst of timestamped breakpoints through the setter
-// below, and the kernel linearly interpolates them into the same alpha it would
-// otherwise synthesize itself -- so an arbitrary shape, not just the triangle.
-extern "C" int64_t lfo_mode;                    // the DSL's @lfo_mode global
-extern "C" void _mlir_ciface_set_value_lfo_breakpoint(double value, int64_t frame);
-static int64_t gLfoMode = 0;                    // host shadow of @lfo_mode (display)
-static double  gHostPhase = 0.0;                // host LFO phase accumulator, [0,1)
-// Breakpoints per block: sample the shape every LFO_BP_STRIDE frames (plus the
-// block-end frame). 128/8 = 16 => ~16 setter calls per block, the heavy traffic
-// this mode exists to exercise. The kernel linearly interpolates between them.
-constexpr int LFO_BP_STRIDE = 8;
+// @cut_lfo_step: the cutoff-LFO SPEED for NEW voices -- table entries advanced per
+// sample. LFO Hz = SAMPLE_RATE * step / L, so step 1 => ~5.5 Hz. It is a plain
+// scalar global (memref<f64>), reached directly as this symbol; the +/- keys scale
+// it live, but the kernel only LATCHES it into a voice at that voice's note-on, so
+// a change sets the speed for notes triggered afterwards while already-sounding
+// voices keep the speed they were born with.
+extern "C" double cut_lfo_step;
+static double    gCutStep = 1.0;                // host shadow of @cut_lfo_step (display)
+constexpr double CUT_STEP_MIN = 0.01;           // ~0.05 Hz (slow)
+constexpr double CUT_STEP_MAX = 1.80;           // ~10 Hz (fast)
+constexpr double CUT_STEP_MUL = 1.25;           // multiplicative +/- step
 
 //===----------------------------------------------------------------------===//
 // MIDI voices: OS MIDI events -> host voice allocation -> kernel (voice, frame)
@@ -244,11 +250,6 @@ static bool setupMidi() {
     return nSrc > 0;
 }
 
-// Automation-speed bounds (samples at 44100): ~10 Hz (fast) to ~0.05 Hz (~20 s).
-constexpr int64_t LFO_PERIOD_MIN = 4410;   // 44100 / 10  -> 10 Hz
-constexpr int64_t LFO_PERIOD_MAX = 882000; // 44100 * 20  -> 0.05 Hz
-constexpr double LFO_STEP = 1.25; // multiplicative step per key press
-
 // Selectable noise colors and their display names. Index 4 ("none") drives the
 // index_switch default (silence), so the knob sweeps every region.
 constexpr int NUM_KINDS = 5;
@@ -286,8 +287,6 @@ static std::atomic<size_t> gTail{0}; // next read index  (consumer)
 // at a time, so wet / noise_kind changes written from the keyboard thread are
 // picked up within a block or two. Renders into a scratch block then copies into
 // the ring (the kernel needs a contiguous 512-wide memref).
-static void emitLfoBlock(); // defined below (with the LFO helpers)
-
 static void renderLoop() {
     double scratch[BLOCK_SAMPLES];
     while (gRunning.load(std::memory_order_relaxed)) {
@@ -303,7 +302,6 @@ static void renderLoop() {
         // (voice, freq, gate, frame) into the kernel, timestamped against now.
         uint64_t nowNanos = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime());
         drainMidiEvents(nowNanos);
-        emitLfoBlock();  // Mode B: stream this block's LFO shape as breakpoints
         fillBlock(scratch);
         for (size_t i = 0; i < BLOCK_SAMPLES; ++i)
             gRing[(head + i) & RING_MASK] = scratch[i];
@@ -335,76 +333,63 @@ static const char *currentKindName() {
     return kKindNames[k];
 }
 
-// Current cutoff-sweep rate in Hz (LFO frequency = sample rate / period).
-static double lfoHz() {
-    return SAMPLE_RATE / static_cast<double>(gLfoPeriod);
-}
-
-// Scale the automation speed by `factor` (>1 = faster sweep -> shorter period),
-// clamped to the sensible band. Rounds so the period stays a whole number.
-// Instead of writing the @lfo_period global directly, schedule the change via
-// the kernel's timestamped setter at frame 0 (apply from the start of the next
-// rendered block); the kernel's phase accumulator interpolates it click-free.
-static void scaleLfoSpeed(double factor) {
-    double p = static_cast<double>(gLfoPeriod) / factor; // faster => smaller period
-    int64_t np = static_cast<int64_t>(p + 0.5);
-    if (np < LFO_PERIOD_MIN) np = LFO_PERIOD_MIN;
-    if (np > LFO_PERIOD_MAX) np = LFO_PERIOD_MAX;
-    gLfoPeriod = np;
-    _mlir_ciface_set_value_lfo_period(np, /*frame=*/0);
-}
-
-// The host-side LFO shape as a function of phase in [0,1). Default: the SAME
-// triangle the kernel synthesizes in Mode A -- alpha = 0.02 + 0.33*(1-|2f-1|) --
-// so the two modes sound alike (a clean A/B check). Swap this body for any
-// function to get an arbitrary cutoff-sweep shape, which is the whole point of
-// the host-side mode (the kernel triangle can only ever be a triangle).
-static double lfoShape(double phase) {
-    double frac = phase - std::floor(phase);
-    double tri = 1.0 - std::fabs(2.0 * frac - 1.0);
-    return 0.02 + 0.33 * tri;
-}
-
-// Per-block host LFO update, called on the render thread right before the kernel
-// invocation. Always advances the host phase (so toggling modes stays roughly
-// continuous); only STREAMS breakpoints when Mode B is active. Because it runs
-// immediately before _mlir_ciface_run on the same thread, the breakpoint writes
-// and the kernel's consume/reset of @lfo_bp are strictly sequential -- no
-// cross-thread race on the array.
-static void emitLfoBlock() {
-    double inc = 1.0 / static_cast<double>(gLfoPeriod); // cycles per sample
-    if (lfo_mode != 0) {
-        const int N = static_cast<int>(BLOCK_SAMPLES);
-        for (int f = 0; f < N; f += LFO_BP_STRIDE)
-            _mlir_ciface_set_value_lfo_breakpoint(lfoShape(gHostPhase + f * inc), f);
-        // Anchor the final frame so the last segment ramps to the right value
-        // instead of the interpolator holding the previous breakpoint flat.
-        _mlir_ciface_set_value_lfo_breakpoint(lfoShape(gHostPhase + (N - 1) * inc), N - 1);
+// Fill the shared cutoff-shape table with one cycle of the looping cutoff LFO.
+// The kernel wraps the index at L, so this MUST be periodic (entry 0 ~= entry
+// L-1) or the wrap clicks. Default: a triangle wah,
+//   alpha(i) = CUT_ALPHA_MIN + CUT_ALPHA_SPAN * |2t-1|^CUT_SHARPNESS,  t = i/L
+// which is bright (0.35) at the wrap (t=0 and t->1) and dips to muffled (0.02) at
+// mid-cycle (t=0.5). CUT_SHARPNESS sets the wah shape: 1 is a plain triangle, >1
+// spends longer bright with a sharper dip. Both endpoints stay bright for any
+// value, so the loop is always click-free. Filled once at start-up here (the
+// SHAPE is a WebUI control for now; this host varies only the sweep SPEED); every
+// voice reads this one table at its own trigger-anchored, wrapping phase.
+static void fillCutShape() {
+    const double invL = 1.0 / static_cast<double>(CUT_SHAPE_LEN);
+    for (int i = 0; i < CUT_SHAPE_LEN; ++i) {
+        double t   = static_cast<double>(i) * invL;   // 0..1 across one LFO cycle
+        double v   = std::fabs(2.0 * t - 1.0);        // 1 at the ends, 0 at mid-cycle
+        double env = std::pow(v, CUT_SHARPNESS);      // bright at wrap, dark mid-cycle
+        voice_cut_shape[i] = CUT_ALPHA_MIN + CUT_ALPHA_SPAN * env;
     }
-    gHostPhase += BLOCK_SAMPLES * inc;
-    gHostPhase -= std::floor(gHostPhase); // keep in [0,1)
+}
+
+// Current cutoff-LFO rate in Hz (= sample rate * step / table length).
+static double cutLfoHz() {
+    return SAMPLE_RATE * gCutStep / static_cast<double>(CUT_SHAPE_LEN);
+}
+
+// Scale the cutoff-LFO speed by `factor` (>1 = faster), clamped to a sensible
+// band, and publish it to @cut_lfo_step. This sets the speed for FUTURE notes: the
+// kernel latches it per voice at note-on, so already-sounding voices are unchanged.
+// A single plain double store on the keyboard thread; the same relaxed discipline
+// the wet/noise_kind knobs use.
+static void scaleCutSpeed(double factor) {
+    double s = gCutStep * factor;
+    if (s < CUT_STEP_MIN) s = CUT_STEP_MIN;
+    if (s > CUT_STEP_MAX) s = CUT_STEP_MAX;
+    gCutStep = s;
+    cut_lfo_step = s;
 }
 
 // Compact status readout: captions on one line, values redrawn on the line below
 // (so it fits narrow terminals and stays easy to refresh -- captions are static
 // and printed once by printCaptions(); printStatus() only rewrites the value row).
 // Both rows share the same column widths so cells line up.
-#define STATUS_FMT "%-8s| %-7s| %-9s| %-7s| %-6s"
+#define STATUS_FMT "%-8s| %-7s| %-9s| %-6s"
 
 static void printCaptions() {
-    printf(STATUS_FMT "\n", "Reduce", "Color", "Sweep", "LFO", "Voices");
+    printf(STATUS_FMT "\n", "Reduce", "Color", "Sweep", "Voices");
     fflush(stdout);
 }
 
 static void printStatus() {
-    char reduce[16], color[16], sweep[16], lfo[16], voices[16];
+    char reduce[16], color[16], sweep[16], voices[16];
     snprintf(reduce, sizeof reduce, "%.0f%%", wet * 100.0);
     snprintf(color,  sizeof color,  "%s", currentKindName());
-    snprintf(sweep,  sizeof sweep,  "%.2f Hz", lfoHz());
-    snprintf(lfo,    sizeof lfo,    "%s", lfo_mode ? "HOST" : "KERNEL");
+    snprintf(sweep,  sizeof sweep,  "%.2f Hz", cutLfoHz());
     snprintf(voices, sizeof voices, "%d/%d",
              gActiveVoices.load(std::memory_order_relaxed), NUM_VOICES);
-    printf("\r" STATUS_FMT, reduce, color, sweep, lfo, voices);
+    printf("\r" STATUS_FMT, reduce, color, sweep, voices);
     fflush(stdout);
 }
 
@@ -537,6 +522,12 @@ int main() {
     wet = 1.0;
     noise_kind = 0; // start on white
 
+    // Fill the shared cutoff-sweep table before any block renders, so voices are
+    // shaped from the very first note (the kernel only inits it to a flat splat),
+    // and publish the initial LFO speed so the host shadow and kernel agree.
+    fillCutShape();
+    cut_lfo_step = gCutStep;
+
     // Connect to the OS MIDI graph. The kernel's tone bank is silent until a
     // note-on arrives, so play a MIDI keyboard (or route an IAC/virtual source).
     // With no device, fall back to the computer keyboard as a one-octave piano.
@@ -575,8 +566,7 @@ int main() {
         std::cout << " -> [A W S E D F T G Y H U J K] one-octave piano (C4..C5) -- press to start, press again to stop" << std::endl;
     std::cout << " -> [UP/DOWN]     more / less cancellation (toward a clean tone)" << std::endl;
     std::cout << " -> [LEFT/RIGHT]  cycle noise color (white/pink/brown/ou/none)" << std::endl;
-    std::cout << " -> [+ / -]       cutoff-sweep speed (faster / slower)" << std::endl;
-    std::cout << " -> [M]           LFO source: KERNEL triangle vs HOST breakpoints" << std::endl;
+    std::cout << " -> [+ / -]       cutoff-LFO speed (faster / slower, in Hz)" << std::endl;
     std::cout << " -> [Q] or Ctrl+C to stop the program safely" << std::endl;
     std::cout << "==============================================\n" << std::endl;
 
@@ -586,23 +576,17 @@ int main() {
 
     char c;
     while (read(STDIN_FILENO, &c, 1) == 1 && c != 'q' && c != 'Q') {
-        // +/- (and =/_) change the cutoff-sweep automation speed. '+' speeds it
-        // up (shorter LFO period), '-' slows it down.
+        // +/- (and =/_) change the cutoff-LFO SPEED for NEW notes: '+' faster, '-'
+        // slower. Writing @cut_lfo_step sets the speed the kernel latches at the
+        // next note-on; already-sounding voices keep the speed they were born with.
+        // (The wah SHAPE is a WebUI control for now.)
         if (c == '+' || c == '=') {
-            scaleLfoSpeed(LFO_STEP);
+            scaleCutSpeed(CUT_STEP_MUL);
             printStatus();
             continue;
         }
         if (c == '-' || c == '_') {
-            scaleLfoSpeed(1.0 / LFO_STEP);
-            printStatus();
-            continue;
-        }
-        // 'M' toggles who computes the cutoff-sweep LFO: the kernel's own triangle
-        // (Mode A) or the host streaming an arbitrary shape as breakpoints (B).
-        if (c == 'm' || c == 'M') {
-            gLfoMode ^= 1;
-            lfo_mode = gLfoMode;
+            scaleCutSpeed(1.0 / CUT_STEP_MUL);
             printStatus();
             continue;
         }
