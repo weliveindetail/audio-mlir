@@ -1,0 +1,314 @@
+/**
+    Adaptive noise canceller (Widrow ANC) -- a Cmajor port of the *current*
+    DSP-MLIR `samples/lms-noise.mlir` kernel (the polyphonic, MIDI-triggered
+    revision, not the old fixed-440-Hz one).
+
+        x[n]   = colored noise (white/pink/brown/ou, or none = silence)
+        n0[n]  = 0.7 x[n] + 0.5 x[n-1] + 0.3 x[n-2]      (a 3-tap "acoustic path")
+        saw_v  = 2*frac(f_v t) - 1                        (per MIDI-triggered voice)
+        tone_v = lowPass(saw_v, alpha_v(t))              (per-voice swept 1st-order IIR)
+        tone   = 0.2 * sum_v gate_v * tone_v             (mixed voice bank)
+        d[n]   = tone[n] + n0[n]                          (tone buried in noise)
+        yhat   = LMS(x -> d), 32-tap adaptive FIR         (estimates the noise)
+        out    = d - wet*yhat                             (noise removed, tone revealed)
+
+    How this maps onto the kernel's structure
+    ------------------------------------------
+    The MLIR kernel is block-based (one `run(out)` per 128-sample block, state in
+    module globals); Cmajor is per-sample streaming, so each recurrence becomes
+    running processor state -- no block size, no manual phase/offset carry.
+
+      * The old continuous 440 Hz tone is gone: the kernel now renders a bank of
+        8 sawtooth VOICES, silent until a MIDI note triggers one (@voice_* globals
+        + the 8-iter decode loop). Here that is a `Voice[8]` array behind the
+        standard `std::voices::VoiceAllocator`.
+      * Each voice runs its OWN trigger-anchored cutoff LFO: at note-on the kernel
+        resets @voice_cut_phase to 0 and LATCHES @cut_lfo_step, then advances the
+        phase per sample and reads a SHARED @voice_cut_shape table (one cycle of a
+        looping wah). Every voice reads the same shape at its own wrapping phase,
+        so the shape is shared but each voice sits at its own point in the cycle.
+        We mirror that: each Voice holds the same `shape[]` table (the native
+        driver's default triangle-wah, the shape a host would otherwise draw) and
+        indexes it at its own `cutPhase`, latching the sweep speed at note-on so a
+        live Sweep change only affects notes played afterwards.
+      * The per-voice one-pole low-pass and the smoothed gate reset at note-on,
+        exactly like the kernel's coeff-masked scans (a stolen voice starts a
+        fresh filter and a fresh attack, not the previous note's tail).
+      * n0 (acoustic path), the runtime noise-color switch, the 32-tap LMS and the
+        wet mix live in a single `Master` stage the summed voices feed into --
+        the block pipeline's `d = tone + n0`, `y = LMS(x->d)`, `out = d - wet*y`.
+
+    The interactive globals (@wet, @mu, @noise_kind, @cut_lfo_step) become
+    `input value` parameters. @cut_lfo_step is expressed here as a Sweep rate in
+    Hz (the kernel relation is LFO Hz = SAMPLE_RATE * step / L, L = 8000).
+*/
+graph LMSNoise  [[ main ]]
+{
+    input event std::midi::Message midiIn;
+    output stream float out;
+
+    // Interactive knobs (were `memref.global "public"` in the MLIR kernel).
+    input value float wet        [[ name: "Noise Cancel", min: 0,       max: 1,    init: 0,     rampFrames: 2000 ]];
+    input value float mu         [[ name: "LMS Rate",     min: 0.00001, max: 0.01, init: 0.001, rampFrames: 500  ]];
+    input value float sweepRate  [[ name: "Sweep Rate",   min: 0.05,    max: 10,   init: 3,     unit: "Hz"       ]];
+    input value int   noiseColor [[ name: "Noise Color",  min: 0,       max: 4,    init: 0,     text: "White|Pink|Brown|OU|None" ]];
+
+    let voiceCount = 8;              // == the kernel's memref<8x...> voice bank
+
+    node
+    {
+        voices         = Voice[voiceCount];
+        voiceAllocator = std::voices::VoiceAllocator (voiceCount);
+        master         = Master;
+    }
+
+    connection
+    {
+        // MIDI -> voice allocation (the host job the kernel's decode loop mirrors:
+        // assign each note to a free voice, steal the oldest on overflow).
+        midiIn -> std::midi::MPEConverter -> voiceAllocator;
+        voiceAllocator.voiceEventOut -> voices.eventIn;
+
+        // Sweep speed broadcasts to every voice; each LATCHES it at its own
+        // note-on (see Voice.eventIn), so a live change only re-speeds new notes.
+        sweepRate -> voices.sweepRate;
+
+        // Sum the 8 voice tones (== the kernel's dsp.reduce over the voice axis)
+        // and feed the mixed tone into the LMS / noise stage.
+        voices -> master.toneIn;
+
+        wet        -> master.wet;
+        mu         -> master.mu;
+        noiseColor -> master.noiseColor;
+
+        master -> out;
+    }
+}
+
+//==============================================================================
+// One MIDI-triggered sawtooth voice with its own trigger-anchored cutoff LFO and
+// one-pole low-pass. Mirrors one lane of the kernel's rank-2 tensor<8x128> voice
+// bank: the saw phase, cutoff-LFO phase, low-pass state and smoothed gate are the
+// per-voice --stream globals, reset/retuned at note-on by the decode loop.
+//==============================================================================
+processor Voice
+{
+    input event (std::notes::NoteOn, std::notes::NoteOff) eventIn;
+    input value float sweepRate;                  // Hz; LATCHED at note-on
+    output stream float out;
+
+    // Shared cutoff-SHAPE table: one cycle of the looping wah, L entries indexed
+    // by the voice's wrapping cutoff-LFO phase (== the kernel's @voice_cut_shape,
+    // memref<8000xf64>). Every voice holds the SAME shape and reads it at its own
+    // phase; the native driver's default is a triangle wah (the shape a host GUI
+    // would otherwise draw), so we build exactly that here.
+    let L = 8000;
+    let cutAlphaMin  = 0.02f;                      // muffled floor (dip of the wah)
+    let cutAlphaSpan = 0.33f;                      // bright(0.35) - muffled(0.02)
+    float[L] shape;
+
+    // --- per-voice --stream state (all reset/latched at note-on) ---
+    float freq;                                    // @voice_freq  (Hz, held while sounding)
+    float sawPhase;                                // @voice_phase (0..1, saw ramp)
+    float cutPhase;                                // @voice_cut_phase (0..1, LFO position)
+    float latchedSweep;                             // @voice_cut_step, latched at note-on (Hz)
+    float sweepMirror;                              // live sweepRate mirror (value endpoints
+                                                    // can't be read in event handlers, so main
+                                                    // copies it here for the note-on to latch)
+    float lpZ;                                      // @voice_lp_state (one-pole y[n-1])
+    float gate;                                     // @voice_gate  (one-pole-smoothed level)
+    float gateTarget;                               // @voice_tgt   (0 released, 1 held)
+
+    void init()
+    {
+        // Triangle wah: alpha(t) = min + span * |2t-1|, t = i/L. Bright (0.35) at
+        // the wrap (t=0 and t->1), muffled (0.02) at mid-cycle -- periodic at the
+        // ends so the phase wrap is click-free, matching the driver's fillCutShape.
+        for (wrap<L> i)
+        {
+            let t = float (i) / float (L);
+            let v = abs (2.0f * t - 1.0f);
+            shape.at (i) = cutAlphaMin + cutAlphaSpan * v;
+        }
+    }
+
+    // note-on: retune, restart BOTH phases from 0, reset the filter, latch the
+    // current sweep speed, and aim the gate at 1 (held). This is the kernel's
+    // per-voice reset: @voice_phase/@voice_cut_phase := 0, @voice_lp_state := 0,
+    // @voice_cut_step := @cut_lfo_step, @voice_tgt := 1.
+    event eventIn (std::notes::NoteOn e)
+    {
+        freq         = std::notes::noteToFrequency (e.pitch);
+        sawPhase     = 0.0f;
+        cutPhase     = 0.0f;
+        lpZ          = 0.0f;
+        latchedSweep = sweepMirror;                 // latch the current sweep speed
+        gateTarget   = 1.0f;
+    }
+
+    // note-off: just release the gate; the one-pole smoother rings it down
+    // click-free (the kernel's @voice_tgt := 0, gate chases it).
+    event eventIn (std::notes::NoteOff e)
+    {
+        gateTarget = 0.0f;
+    }
+
+    void main()
+    {
+        let sr = float (processor.frequency);
+
+        loop
+        {
+            sweepMirror = sweepRate;                // keep the latch source current
+
+            // --- sawtooth: 2*frac(f t) - 1 ---
+            let saw = 2.0f * sawPhase - 1.0f;
+            sawPhase += freq / sr;
+
+            while (sawPhase >= 1.0f)
+                sawPhase -= 1.0f;
+
+            // --- per-voice swept one-pole low-pass: alpha read from the shared
+            //     shape at THIS voice's wrapping cutoff-LFO phase ---
+            let idx   = wrap<L> (int (cutPhase * float (L)));
+            let alpha = shape.at (idx);
+            lpZ += alpha * (saw - lpZ);
+
+            // advance the cutoff-LFO by the latched speed (entries(cycle)/sample)
+            cutPhase += latchedSweep / sr;
+
+            while (cutPhase >= 1.0f)
+                cutPhase -= 1.0f;
+
+            // --- one-pole gate smoother g += kc*(tgt - g), kc = 0.01 (the kernel's
+            //     akc), for click-free attack/release ---
+            gate += 0.01f * (gateTarget - gate);
+
+            // Mixed with the kernel's uniform 0.2 per-voice gain (commutes with
+            // the sum, so applying it here == scaling the reduced tone).
+            out <- 0.2f * gate * lpZ;
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// Noise + acoustic path + 32-tap LMS canceller. Takes the mixed voice tone as its
+// input stream (the kernel's `tone`), buries it in colored noise, then learns and
+// subtracts the noise path -- the block pipeline's `d = tone + n0`,
+// `y = LMS(x->d)`, `out = d - wet*y`.
+//==============================================================================
+processor Master
+{
+    input stream float toneIn;
+    output stream float out;
+
+    input value float wet;
+    input value float mu;
+    input value int   noiseColor;
+
+    let numTaps = 32;
+
+    // --- LMS state (adaptive weights + circular reference history) ---
+    float[numTaps] w;         // adaptive tap weights (the persistent stream-state global)
+    float[numTaps] xbuf;      // circular buffer of the reference x[n]
+    wrap<numTaps>  head;      // xbuf[head] = current x[n], xbuf[head-k] = x[n-k]
+
+    // --- colored-noise generator state (one lane per index_switch case) ---
+    std::random::RNG rng;
+    float[12] pinkValues;     // Voss-McCartney octave accumulators (as std::noise::Pink)
+    int       pinkCount;
+    float     pinkLast;
+    float     brownLast;
+    float     ouState;
+
+    void init()
+    {
+        rng.seed (2112);
+    }
+
+    // Runtime-selectable noise color -- the per-sample analog of the MLIR
+    // dsp.index_switch selector. Cases 0..3 are stateful; case 4 (none) is silence.
+    float nextNoise (int color)
+    {
+        let white = rng.getBipolar();
+
+        if (color == 0)                      // white
+            return white;
+
+        if (color == 1)                      // pink (Voss-McCartney, as std::noise::Pink)
+        {
+            let count = ++pinkCount;
+            var level = pinkLast;
+
+            for (wrap<12> i)
+            {
+                if (((count >> i) & 1) != 0)
+                {
+                    level -= pinkValues[i];
+                    pinkValues[i] = white;
+                    level += white;
+                    break;
+                }
+            }
+
+            pinkLast = level;
+            return (1.0f / 11.0f) * level;
+        }
+
+        if (color == 2)                      // brown (bounded random walk, as std::noise::Brown)
+        {
+            var level = brownLast + white;
+
+            if (level < -32.0f || level > 32.0f)
+                level -= white;
+
+            level *= 0.998f;
+            brownLast = level;
+            return (1.0f / 32.0f) * level;
+        }
+
+        if (color == 3)                      // Ornstein-Uhlenbeck (mean-reverting leaky integrator)
+        {
+            ouState += 0.05f * (0.0f - ouState) + 0.1f * white;
+            return ouState;
+        }
+
+        return 0.0f;                         // none = silence
+    }
+
+    void main()
+    {
+        loop
+        {
+            // --- reference noise x[n], written into the circular history ---
+            let x = nextNoise (noiseColor);
+            xbuf[head] = x;
+
+            // --- acoustic path n0 = 0.7 x[n] + 0.5 x[n-1] + 0.3 x[n-2] ---
+            let n0 = 0.7f * xbuf[head]
+                   + 0.5f * xbuf[wrap<numTaps> (head - 1)]
+                   + 0.3f * xbuf[wrap<numTaps> (head - 2)];
+
+            // --- desired signal d = tone + colored noise ---
+            let d = toneIn + n0;
+
+            // --- 32-tap LMS: estimate the correlated noise, adapt the weights ---
+            var yhat = 0.0f;
+
+            for (wrap<numTaps> k)
+                yhat += w[k] * xbuf[wrap<numTaps> (head - k)];
+
+            let e = d - yhat;                                  // error == cleaned signal at wet=1
+
+            for (wrap<numTaps> k)
+                w[k] += mu * e * xbuf[wrap<numTaps> (head - k)];
+
+            // --- out = d - wet*yhat  (wet = 1 -> full cancellation, tone revealed) ---
+            out <- d - wet * yhat;
+
+            ++head;
+            advance();
+        }
+    }
+}

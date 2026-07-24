@@ -171,7 +171,8 @@ int main(int argc, char **argv) {
         renderDiscard(buf.data(), warmup);
 
         perBlockMs.clear();
-        double checksum = 0.0;
+        double checksum = 0.0; // accumulated over FINITE samples only
+        size_t nonfinite = 0;  // blocks whose sampled output was inf/nan
         for (size_t i = 0; i < iterations; ++i) {
             const auto t0 = clock::now();
             for (size_t b = 0; b < CHUNK; ++b) renderInto(buf.data());
@@ -179,8 +180,15 @@ int main(int argc, char **argv) {
             const double chunkMs =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
             perBlockMs.push_back(chunkMs / static_cast<double>(CHUNK));
-            checksum += buf[i % BLOCK];
+            // Timing above is valid regardless of value stability; guard the
+            // checksum so a divergent run stays comparable (see ports/bench.sh --
+            // the f64 kernel is stable here, but the field keeps the BENCH_JSON
+            // schema identical to the ports harness for A/B tooling).
+            const double s = buf[i % BLOCK];
+            if (std::isfinite(s)) checksum += s;
+            else ++nonfinite;
         }
+        const bool diverged = nonfinite > 0;
         gSink += checksum;
 
         std::vector<double> sorted = perBlockMs;
@@ -209,16 +217,21 @@ int main(int argc, char **argv) {
         std::printf("  real-time : %.1fx budget  (uses %.2f%% of the %.4f ms block)\n",
                     headroomX, budgetPct, BLOCK_BUDGET_MS);
         std::printf("  throughput: %.2f Msample/s (median)\n", msamplePerS);
+        if (diverged)
+            std::printf("  WARNING   : %zu/%zu sampled blocks non-finite.\n",
+                        nonfinite, iterations);
         std::printf(
-            "  BENCH_JSON {\"config\":\"%s\",\"noise_kind\":%lld,\"wet\":%.1f,"
-            "\"voices\":%d,\"iterations\":%zu,\"chunk\":%zu,\"warmup\":%zu,"
-            "\"min_ms\":%.6f,\"median_ms\":%.6f,\"mean_ms\":%.6f,\"p90_ms\":%.6f,"
-            "\"p99_ms\":%.6f,\"stddev_ms\":%.6f,\"realtime_x\":%.3f,"
-            "\"budget_pct\":%.3f,\"msample_per_s_median\":%.3f,"
-            "\"checksum\":%.15e}\n\n",
+            "  BENCH_JSON {\"target\":\"kernel\",\"config\":\"%s\","
+            "\"noise_kind\":%lld,\"wet\":%.1f,\"voices\":%d,\"iterations\":%zu,"
+            "\"chunk\":%zu,\"warmup\":%zu,\"min_ms\":%.6f,\"median_ms\":%.6f,"
+            "\"mean_ms\":%.6f,\"p90_ms\":%.6f,\"p99_ms\":%.6f,\"stddev_ms\":%.6f,"
+            "\"realtime_x\":%.3f,\"budget_pct\":%.3f,"
+            "\"msample_per_s_median\":%.3f,\"diverged\":%s,"
+            "\"nonfinite_blocks\":%zu,\"checksum\":%.15e}\n\n",
             c.name, static_cast<long long>(c.noise), c.wet, c.voices, iterations,
             CHUNK, warmup, minMs, medMs, meanMs, p90Ms, p99Ms, stddevMs, headroomX,
-            budgetPct, msamplePerS, checksum);
+            budgetPct, msamplePerS, diverged ? "true" : "false", nonfinite,
+            checksum);
     }
 
     if (std::isnan(gSink)) std::fprintf(stderr, "unreachable %g\n", gSink);

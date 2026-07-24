@@ -1,0 +1,11 @@
+{
+    "CmajorVersion":    1,
+    "ID":               "dev.cmajor.examples.lmsnoise",
+    "version":          "1.0",
+    "name":             "LMSNoise",
+    "description":      "Adaptive (Widrow LMS) noise canceller -- a Cmajor port of the polyphonic DSP-MLIR lms-noise kernel",
+    "manufacturer":     "DSP-MLIR",
+    "isInstrument":     true,
+
+    "source":           "LMSNoise.cmajor"
+}
