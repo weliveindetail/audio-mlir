@@ -676,16 +676,26 @@ remain open. See the per-task status below.
 
 ### Axis A -- backend codegen quality
 
-- [ ] A1. Vectorize the LMS 32-tap loops (NEON). Both the filter dot-product and the weight
+- [~] A1. Vectorize the LMS 32-tap loops (NEON). Both the filter dot-product and the weight
   update are scalar (fmul/fadd per tap). The inner `0 to 32` loop over the tap weights is the
   vectorization target (the outer sample loop carries the adaptive recurrence and stays
-  sequential). Needs A2 first: the per-tap `affine.if` history guard must be gone for a clean
-  vectorizable body. Verify NEON (`fmla v*.2d`) appears in the tap-loop disassembly.
-- [ ] A2. Hoist the history-boundary branch out of the tap loop. The `affine.if (n-k>=0)`
-  selects current-block vs carried-history sample on every one of the 128 x 32 x 2 tap
-  iterations. Split the sample loop into a head (n < 32, needs the history line) and a
-  steady state (n >= 32, pure current-block, no branch) -- what a C programmer writes by hand.
-  This unblocks A1 (a clean steady-state loop vectorizes; a branchy one does not).
+  sequential). **A2 is now done, so the steady-state tap loops are branch-free and
+  vectorizable** -- A1 is gated only on *enabling the affine vectorizer*
+  (`createAffineVectorizePass`, still commented out of `--opt`, the same lever the voice-bank
+  rewrite left off). Once on, verify NEON (`fmla v*.2d`) appears in the tap-loop disassembly.
+- [x] A2. Hoist the history-boundary branch out of the tap loop. **DONE (Layer 0).**
+  `LMSFilterResponseOpLowering` (`LowerToAffineLoops.cpp`) now splits the sample loop at
+  `splitN = FilterLength-1` (=31): a **head** `affine.for 0 to 31` keeps the `affine.if
+  (n-i>=0)` + history else-branch (needed for the first taps-1 outputs / `--stream`
+  continuity), and a **steady** `affine.for 31 to 128` drops the guard entirely -- the two
+  inner `affine.for 0 to 32` tap loops are pure current-block loads (`x[n-i]`), no `affine.if`.
+  Verified in the `--emit=mlir-affine` dump: exactly 2 `affine.if` remain, both inside the head
+  loop; the steady tap loops are clean. The per-sample body is factored into an `emitSample`
+  lambda whose tap bodies are `emitDotTap` / `emitUpdateTap` helpers (the windowed-dot and
+  rank-1-update primitives -- see the decomposition roadmap below; this is the in-lowering
+  seed of Layer 1). Pure structural change: `lms-noise-check.sh` stays **13/13** under both
+  `--opt` and `OPT=0` with a **bit-identical** checksum (`-2.749372436647042e+03`). This
+  unblocks A1.
 - [x] A3. Stop heap-allocating buffers/scalars. DONE: all statically-shaped buffers ≤64 KiB
   stack-promote to `memref.alloca`; the emitted IR has 0 malloc/free in both pipelines, and
   `AssertNoHeapAllocPass` (default-on) enforces it at compile time. `--opt` additionally
@@ -700,12 +710,42 @@ remain open. See the per-task status below.
   polish, not correctness.
 
 Status legend: [ ] = open, [~] = partially addressed by `--opt`, [x] = done.
-A3/A5 are done (malloc-free, compile-time-guaranteed). A1 and A2 are the remaining hot-path
-wins; A2 unblocks A1.
+A2/A3/A5 are done (branch-free steady tap loops; malloc-free, compile-time-guaranteed). A1 is
+the remaining hot-path win, now gated only on enabling the affine vectorizer.
 
-Order to attempt: A2 first (makes the LMS tap loop branch-free), then A1 (vectorize the now-
-clean loop -- the real win), then finish A4 (fuse the remaining elementwise chain). Measure
-per-block time before/after each.
+Order to attempt: ~~A2 first~~ (done -- LMS tap loop is branch-free in the steady state), then
+A1 (enable `createAffineVectorizePass` and vectorize the now-clean loop -- the real win), then
+finish A4 (fuse the remaining elementwise chain). Measure per-block time before/after each.
+
+#### Layered decomposition roadmap (LMS -> composable ops)
+
+The A2 loop-split is **Layer 0** of a three-layer plan to decompose the monolithic
+`dsp.lmsFilterResponse` into the same composable primitives the voice bank uses, staged so each
+layer is independently useful and low-risk. The *hot path* is the LMS (~8.2K of ~10K
+flops/block); the voice-bank tensor-land rewrite only touched the ~17% cold path, so this is
+where a "substantial" win lives -- but only paired with the vectorizer (A1), since decomposition
+without SIMD regressed the voice bank ~25-28% by materializing intermediates.
+
+- **Layer 0 (done, this section = A2).** Restructure `LMSFilterResponseOpLowering` only: head/
+  steady sample-loop split so the steady tap loops are branch-free (A1-ready), with the tap
+  bodies factored into `emitDotTap` / `emitUpdateTap` lowering helpers. No new dialect ops, no
+  materialized `128x32` window buffer -- weights stay in the `lms` global / registers, so it
+  carries **no** voice-bank-style materialization-regression risk. Bit-identical.
+- **Layer 1 (deferred).** Promote those helpers to real dialect ops **`dsp.windowedDot`** (y[n] =
+  sum_i w[i]*x[n-i]) and **`dsp.rank1Update`** (w += scale*x-window), reusable by
+  `dsp.FIRFilterResponse` / correlation / NLMS / RLS. These are *not* viable as standalone
+  top-level tensor ops (w changes every sample -> no single w to apply across the block); they
+  are the *body* of a recurrence carrier. Matches the "What ops to add" composable-primitive
+  set above. **Do this only once a second consumer (FIR/another adaptive filter) exists** --
+  with LMS as the sole user it is speculative op surface.
+- **Layer 2 (deferred, sets up B1).** Generalize `dsp.scan` to carry a **k-vector state**
+  (`memref<Vxkf64>`; the k>=2 form flagged unimplemented in the `dsp.scan` op notes above).
+  LMS is then one instantiation of the state-space recurrence
+  `w[n] = (I - mu*x_n x_n^T)*w[n-1] + mu*d[n]*x_n` -- a rank-1-perturbed-identity transition --
+  sharing one carrier with biquads (k=2) and the colored-noise/IIR filters. Keep the structured
+  rank-1 form (do NOT materialize the dense 32x32 A_n: 1024 vs 32 flops/sample). This is the
+  single place to derive the parallel-scan / state-space blocking (see B1) once for the whole
+  toolkit. Biggest op surface; follows Layer 0, does not precede it.
 
 ### Axis B -- domain-specific optimizations
 
@@ -720,7 +760,13 @@ reference kernel, which has no large linear FIR.)
   section applies: a linear recurrence can be reassociated / cast to a state-space transition
   form (`state_block = f(state, x_block)`) to expose parallelism instead of a naive per-sample
   scan. (This replaces the osc-only "FIR -> FFT convolution" item; lms-noise has no large FIR
-  to FFT.)
+  to FFT.) Concretely LMS *is* linear in `w`: `w[n] = (I - mu*x_n x_n^T)*w[n-1] + mu*d[n]*x_n`,
+  a rank-1-perturbed-identity transition matrix -- exactly the state-space form. **This is
+  Layer 2 of the LMS decomposition roadmap (Axis A):** consolidating LMS onto a k-vector
+  `dsp.scan` shares this recurrence primitive with biquads / colored-noise filters, so the
+  parallel-scan blocking is derived once. Caveat: products of `(I - mu x x^T)` do NOT stay
+  rank-1, so composing transitions for a parallel scan is the genuinely hard part -- Layer 2
+  sets B1 up, it does not make it free.
 - [ ] B2. Hoist loop-invariant DSP work. Coefficients/state that only change when a knob moves
   can be lifted and refreshed only on change -- e.g. the one-pole sweep alpha is recomputed per
   block from the LFO phase, but between blocks where `@lfo_period` is unchanged the per-sample
