@@ -898,3 +898,75 @@ independent voice lanes even without wide SIMD.
   keeping the `sequential` scan lowering (their zero-overhead loops + circular
   addressing make the sequential recurrence cheap -- the associative rewrite is not
   needed and would only add work).
+
+## Multi-channel (stereo) -- UNADDRESSED
+
+**Status: not working.** A per-voice-panning stereo path was prototyped end-to-end
+but produced audible distortion even for a single note, so the change was reverted.
+The kernel is back to mono (`@run(%out: memref<128xf64>)`, `out = d - wet*y`). This
+section records the approach that was tried so a later attempt can start informed.
+
+**Goal.** Turn the mono mix into stereo by giving each of the 8 voices its own,
+host-identifiable pan, ideally computed tensor-parallel (no per-sample host loop).
+
+**Approach that was tried (kernel side).**
+
+- **Channel axis.** Add a leading channel dim mirroring the voice-batch axis:
+  `@run(%out: memref<2x128xf64>)`, channel-major (row 0 = L, row 1 = R). The
+  destination-passing ABI needed only a verifier relaxation in `FuncOpLowering`
+  (`ReturnOpLowering`'s `memref.copy` is already rank-agnostic); the emitted
+  `_mlir_ciface_run` takes a rank-2 descriptor `{ptr, ptr, i64, [2 x i64], [2 x i64]}`.
+- **Panning as a matmul.** Voices are `vg : tensor<8x128>` (low-passed * gate). Pan
+  is a `pan : tensor<2x8>` gain matrix (row 0 = L gains, row 1 = R gains, column v =
+  voice v's distinct pan, 0.2 mix folded in). Then `tone = matmul(pan, vg) : 2x128`
+  -- a single tensor-parallel op that replaces the old mono `reduce(axis=0)+gain`.
+  Constant-power (cos/sin) law, so a centered voice is `0.2/sqrt(2)` in each channel.
+- **Per-voice pan as a runtime global.** To make each voice's pan host-settable
+  (rather than a baked constant), `pan` was sourced from a global
+  `@voice_pan_gain : memref<2x8xf64>` via `dsp.fromGlobal` (its lowering is
+  rank-agnostic -- just `memref.get_global`). The host writes each voice's (L,R)
+  gains at note-on, panning **by note pitch** (not by the arbitrary allocator slot,
+  which was the first regression: voice 0 was hard-left, so single notes / mono
+  melodies collapsed to the left channel).
+- **Mono ANC residual, broadcast to both channels.** `resid = noise - wet*y` is
+  mono/centered. With no broadcast primitive (BinaryOp indexes operands at the
+  result's IVs; noise ops are rank-1-locked; no concat/stack op), it was lifted with
+  `reshape(resid : 128) -> 1x128` then `matmul(ones<2x1>, resid<1x128>) -> 2x128`,
+  and added: `out = tone + residS`. The mono `%tone` (reduce+gain) was kept because
+  `d = tone + noise` still feeds the LMS.
+
+**Compiler changes it required (also reverted):** relax the `run` rank check to 1 or
+2; fix a latent `MatmulOpLowering` bug (output-col and contraction loops both reused
+`lhs.shape[1]`, only correct for square rhs); add a general `ReshapeOpLowering`
+(row-major flat copy -- the dialect is `addIllegalDialect`, so a live `dsp.reshape`
+had no lowering).
+
+**Host changes it required (also reverted):** rank-2 descriptor; deinterleave row 0 ->
+left ring, row 1 -> right ring (two rings, or interleaved); `setVoicePan(v, pos)`
+constant-power writer into `voice_pan_gain`; pan-by-pitch at note-on.
+
+**What was verified vs. what still failed.**
+
+- Offline (kernel called directly) looked *clean*: no NaN/clip, LMS still converged
+  (residual RMS 0.51 -> 0.015), a single centered note gave `Lrms == Rrms`, and a
+  host-forced hard-right voice gave `L=0, R>0`. So the numeric signal path seemed
+  correct.
+- **But live playback was still distorted, even for a single note** -- the reason was
+  not found before reverting. Suspects not yet ruled out: the real-time ring/callback
+  path under CoreAudio (the offline harness never exercises it), the f64->f32 stereo
+  delivery, or a genuine per-channel artifact the L+R downmix in the check harness
+  hides. The offline check's `note_A4_fundamental` also stayed below its (mono-era)
+  `g440 > 0.05` threshold (0.0281), which may be a related signal issue or just a
+  stale threshold for the constant-power center (-3 dB/channel).
+
+**Open questions for the next attempt.**
+
+- Reproduce the distortion *through the ring/callback* offline (simulate the two-ring
+  producer/consumer) before touching the kernel again -- the kernel output itself
+  measured clean, so the driver path is the prime suspect.
+- Decide pan representation: the `2x8` gain global (done here, minimal kernel -- one
+  `fromGlobal` + the existing matmul) vs. a per-voice pan *scalar* `memref<8xf64>`
+  (cleaner "one number per voice", but needs cos/sin on a tensor and a way to
+  assemble `2x128` without a stack/concat op -- which the dialect lacks).
+- Confirm whether the `note_A4_fundamental` threshold needs recalibrating for a
+  stereo downmix or whether it signals a real level regression.
