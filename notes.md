@@ -25,11 +25,11 @@ peak throughput (see the dedicated section below). Everything downstream — fix
 size, block-rate control, malloc-free kernels, per-block worst-case latency as the
 metric — follows from that priority.
 
-The compiler and dialect live in the LLVM fork (`../DSP_MLIR`, ops in
-`mlir/examples/dsp/SimpleBlocks/include/toy/Ops.td`, lowering + stream/fusion passes in
-`mlir/LowerToAffineLoops.cpp`, driver `toyc.cpp`). This `samples/` repo holds the demo
-pipeline (`lms-noise.mlir`), its hosts, and these notes. Local checkout/build specifics
-are in `.claude/env.md`.
+The compiler and dialect live in the [DSP-MLIR LLVM fork](https://github.com/weliveindetail/dsp-mlir/) 
+that implements ops in `mlir/examples/dsp/SimpleBlocks/include/toy/Ops.td`,
+lowering + stream/fusion passes in `mlir/LowerToAffineLoops.cpp`
+and the compiler driver in `toyc.cpp`.
+The repo here holds the demo kernel `lms-noise.mlir`, a native and a WASM host, simple tests, benchmark and research notes.
 
 ## Goals
 

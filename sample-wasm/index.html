@@ -182,6 +182,13 @@ function createKernel({ url, blockSamples }) {
   let memory, f64, u8, dv, exports = null;
   let bump = 0, OUT_PTR = 0, DESC_PTR = 0, ARENA_BASE = 0;
   let cutStep = 1.0;                         // @cut_lfo_step shadow (entries/sample)
+  // Total samples the kernel has rendered — a host shadow of its --stream clock.
+  // The kernel's per-voice cutoff-LFO phase now lives in a private dsp.scan state
+  // global (see lms-noise.mlir: the scan "carries its own stream state, replacing
+  // the old @voice_cut_phase manual carry"), so @voice_cut_phase is a dead global
+  // the host can no longer read. We instead reconstruct each voice's phase from
+  // this clock and the step it latched at note-on (see getPlayheads).
+  let samplePos = 0;
   // The LFO shape as one cycle of CURVE_LEN values in [0,1]; defaults to a
   // triangle until the editor pushes one. Written into @voice_cut_shape on load
   // and on every edit (resampled to CUT_TABLE_LEN entries).
@@ -283,7 +290,7 @@ function createKernel({ url, blockSamples }) {
   // after consuming it. Events are queued from the UI thread and drained at the top
   // of each render() callback with frame 0 (sub-buffer timing is inaudible here).
   const NUM_VOICES = 8;
-  const voices = Array.from({ length: NUM_VOICES }, () => ({ note: -1, active: false, order: 0, step: cutStep }));
+  const voices = Array.from({ length: NUM_VOICES }, () => ({ note: -1, active: false, order: 0, step: cutStep, startSample: 0 }));
   let voiceOrder = 0;
   const noteQ = [];
   const noteToHz = (n) => 440 * Math.pow(2, (n - 69) / 12);
@@ -297,8 +304,11 @@ function createKernel({ url, blockSamples }) {
         if (v < 0) { v = 0; for (let i = 1; i < NUM_VOICES; i++) if (voices[i].order < voices[v].order) v = i; }
         // Record the step this voice latches at note-on (the kernel latches
         // @cut_lfo_step in lockstep), so its playhead rate is correct even after
-        // the Sweep control is changed for later notes.
-        voices[v] = { note, active: true, order: voiceOrder++, step: cutStep };
+        // the Sweep control is changed for later notes. startSample anchors the
+        // voice's cutoff-LFO phase to the stream clock: the kernel resets that
+        // phase to 0 at this note-on (dispatched at frame 0 == the next block the
+        // render loop emits), so phase == (samplePos - startSample) * step, wrapped.
+        voices[v] = { note, active: true, order: voiceOrder++, step: cutStep, startSample: samplePos };
         exports._mlir_ciface_set_note_event(BigInt(v), noteToHz(note), 1.0, 0n);
       } else {
         for (let i = 0; i < NUM_VOICES; i++)
@@ -329,27 +339,33 @@ function createKernel({ url, blockSamples }) {
   function render(outFloat32) {
     const base = OUT_PTR / 8;
     drainNotes();                              // apply queued piano note on/offs
+    // (drainNotes runs first, so a note-on this call anchors at the current
+    // samplePos == the first sample of the block we're about to emit — exactly
+    // where the kernel resets that voice's cutoff-LFO phase to 0.)
     for (let n = 0; n < outFloat32.length; n += blockSamples) {
       bump = ARENA_BASE;                       // fresh arena per block
       exports._mlir_ciface_run(DESC_PTR);      // native ABI: pointer to descriptor
       for (let i = 0; i < blockSamples; ++i)
         outFloat32[n + i] = f64[base + i];     // f64 → f32 on copy
+      samplePos += blockSamples;               // advance the stream clock in lockstep
     }
   }
 
   // Editor-playhead source: with per-voice phases there is no single global LFO
-  // position, so we surface EVERY active voice as its own cursor. For each active
-  // slot we read its cutoff-LFO phase [0,1) from @voice_cut_phase in linear memory
-  // and pair it with that voice's latched rate (cycles/sample = step / table len),
-  // so the synth can extrapolate each cursor independently against the audio clock.
-  // Empty array when nothing is playing → no cursors drawn.
+  // position, so we surface EVERY active voice as its own cursor. The kernel now
+  // keeps each voice's cutoff-LFO phase in a private dsp.scan stream-state global
+  // the host can't read (@voice_cut_phase is dead — see samplePos), so we RECONSTRUCT
+  // it: the kernel's cphase scans cp[n]=cp[n-1]+step, reset to 0 at note-on and read
+  // mod L, so phase == ((samplePos - startSample) * step / L) mod 1. We pair it with
+  // that voice's latched rate (cycles/sample = step / table len) so the synth can
+  // extrapolate each cursor independently against the audio clock. Empty array when
+  // nothing is playing → no cursors drawn.
   const getPlayheads = () => {
-    if (!exports || !exports.voice_cut_phase) return [];
-    const base = exports.voice_cut_phase.value / 8;
+    if (!exports) return [];
     const out = [];
     for (let v = 0; v < NUM_VOICES; v++) {
       if (!voices[v].active) continue;
-      const cp = f64[base + v];                       // [0, CUT_TABLE_LEN)
+      const cp = (samplePos - voices[v].startSample) * voices[v].step;   // unwrapped entries
       out.push({ voice: v, phase: (cp / CUT_TABLE_LEN) % 1, rate: voices[v].step / CUT_TABLE_LEN });
     }
     return out;
